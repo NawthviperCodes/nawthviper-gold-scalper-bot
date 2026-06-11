@@ -1,147 +1,138 @@
-<!-- PROJECT BANNER -->
-<p align="center">
-  <img src="https://via.placeholder.com/1000x220.png?text=NawthViper+Currency+Bot" alt="NawthViper Banner"/>
-</p>
+﻿# NawthViper Gold Scalper Bot
 
-<h1 align="center">💸 NawthViper Currency Bot</h1>
-<p align="center">Institutional-grade multi-timeframe automated trading system for MetaTrader 5</p>
+NawthViper Gold Scalper Bot is a MetaTrader 5 trading bot with a Python/Flask backend and a React dashboard. It is built around a research-driven zone reversal strategy for gold, with `XAUUSDz` enabled by default in `backend/config.json`.
 
-<p align="center">
-  <!-- Badges -->
-  <img src="https://img.shields.io/badge/version-2.0.0-blue.svg" />
-  <img src="https://img.shields.io/badge/python-3.10+-yellow.svg" />
-  <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" />
-  <img src="https://img.shields.io/badge/license-MIT-orange.svg" />
-</p>
+This project is for education, research, and demo-account testing. Trading is risky, and no strategy can guarantee profit.
 
----
+## What It Does
 
-## 🖼️ Preview / Dashboard Screenshots
+- Connects to MetaTrader 5 through the `MetaTrader5` Python API.
+- Runs the trading engine in a background thread from the Flask API.
+- Monitors configured gold symbols in parallel using a thread pool.
+- Detects higher-timeframe trend bias, supply/demand zones, and recent zone touches.
+- Generates buy/sell signals from a simplified v2 zone reversal model.
+- Places MT5 market orders when `DRY_RUN` is disabled.
+- Trails stop losses, checks partial TP logic, and logs closed trade outcomes.
+- Blocks trading during risk events such as daily loss/drawdown limits, consecutive-loss circuit breaker, and high-impact news.
+- Sends Telegram alerts when `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are configured.
+- Provides a React dashboard for MT5 login, starting/stopping the bot, positions, account stats, and recent account history.
 
-<p align="center">
-  <img src="https://via.placeholder.com/800x400.png?text=Dashboard+Preview" width="80%" />
-</p>
+## How It Trades
 
-<p align="center">
-  <img src="https://via.placeholder.com/800x400.png?text=Trade+Execution+Logs" width="80%" />
-</p>
+The live engine is centered on `backend/scalper_strategy_engine.py` and `backend/trade_decision_engine.py`.
 
----
+1. The bot reads settings from `backend/config.json`, including symbols, timeframes, TP ratio, confidence threshold, and dry-run mode.
+2. For each symbol, it pulls market data from MT5:
+   - H4 for higher-timeframe bias using EMA 50 vs EMA 200.
+   - H1 for supply/demand zone detection.
+   - M5 for confirmation and recent touch context.
+3. It only continues when the higher-timeframe bias is not neutral and enough H1/M5 candles are available.
+4. It detects demand and supply zones, then looks for recent tap or deep touches into A/B quality zones.
+5. It rejects weak setups, overused zones, full touches, missing reclaim confirmation, low RR, inactive strategies, and conflicting live trades.
+6. A valid buy setup comes from demand-zone rejection. A valid sell setup comes from supply-zone rejection.
+7. Stop loss is built around the sweep wick plus a 0.15 ATR buffer.
+8. Take profit is fixed by the configured R multiple, currently `TP_RATIO: 2.0`.
+9. Confidence is adjusted by zone quality, freshness, touch depth, M5 trend, H4 bias, and optional doji/pin-bar bonuses.
+10. If confidence meets the configured threshold, the bot sizes the trade and sends the order through MT5.
 
-## ⚙️ Overview
+By default, `DRY_RUN` is set to `true`, so the bot can generate signals without placing live orders.
 
-NawthViper Currency Bot is a professionally engineered trading engine designed for high-probability scalping using:
+## Risk Controls
 
-- Price Action  
-- Multi-Timeframe Analysis  
-- Institutional Supply/Demand Zones  
-- CRT (Candle Range Theory)  
-- Volatility-Adaptive Risk Management  
+- `DRY_RUN` mode for testing without execution.
+- Daily loss and max drawdown limits through `emergency_control.py`.
+- Consecutive-loss circuit breaker per symbol.
+- High-impact news filter.
+- One active same-symbol conflict check before placing trades.
+- Broker-aware lot sizing and filling-mode detection.
+- Optional Telegram status and trade notifications.
 
----
+## Tech Stack
 
-## 🚀 Key Features
+| Layer | Tools |
+| --- | --- |
+| Backend | Python, Flask, Flask-CORS |
+| Trading | MetaTrader 5 Python API |
+| Analysis | pandas, numpy, ta |
+| News/HTTP | requests, beautifulsoup4 |
+| Frontend | React, Vite, Tailwind CSS, Chart.js |
 
-### 🧠 Strategy & Analysis
-- **H4 EMA Bias (50/200)** – long-term trend control  
-- **H1 Supply/Demand Zones** using explosive departure logic  
-- **M5 Entry Confirmation** via Engulfing, Pin Bar, Morning/Evening Star  
-- **M1 CRT Filter** for intraday precision  
-- **RSI / MACD / VWAP** confluence filters  
+## Project Structure
 
----
+```text
+Currency_v2/
+|-- backend/
+|   |-- api_server.py              # Flask API and dashboard endpoints
+|   |-- main.py                    # Real-time bot loop
+|   |-- scalper_strategy_engine.py # Symbol cycle, filters, execution trigger
+|   |-- trade_decision_engine.py   # Zone reversal decision model
+|   |-- trade_executor.py          # MT5 order placement and SL/TP management
+|   |-- zone_detector.py           # Supply/demand zone detection
+|   |-- emergency_control.py       # Daily loss and drawdown controls
+|   |-- performance_tracker.py     # Trade logging and summaries
+|   |-- telegram_notifier.py       # Telegram alerts via environment variables
+|   |-- config.json                # Bot settings and strategy parameters
+|   `-- requirements.txt
+|-- frontend/
+|   |-- src/
+|   |-- package.json
+|   `-- vite.config.js
+`-- README.md
+```
 
-### 🛡️ Risk & Trade Management
-- Emergency Equity Control (Daily Loss / Total Drawdown)  
-- Live High-Impact News Filter (ForexFactory)  
-- Partial TP (1:1 RR) + Auto Breakeven  
-- ATR-based Trailing Stop  
-- Dynamic Lot Sizing based on equity % and SL distance  
+## Setup
 
----
+### Backend
 
-### 🖥️ UI & System Architecture
-- Modern **React + Tailwind** dashboard  
-- Clean Telegram notifications  
-- Modular Python backend  
-- 24/7 deployment-ready on VPS or Render  
-
----
-
-## 🧠 Tech Stack
-
-| Layer | Technology | Description |
-|------|------------|-------------|
-| Frontend | React, TailwindCSS | Real-time dashboard |
-| Backend | Python (FastAPI/Flask) | API + bot engine |
-| Strategy Engine | Python | Core logic, filters, S/D zones |
-| Libraries | MetaTrader5, Pandas, TA, BS4 | Indicators & scraping |
-| Database | PostgreSQL / CSV | Trades & analytics |
-| Deployment | VPS / Render | 24/7 uptime |
-
----
-
-## 📂 Project Structure
-
-```plaintext
-nawthviper_currency/
-├── backend/
-│   ├── main.py
-│   ├── scalper_strategy_engine.py
-│   ├── trade_decision_engine.py
-│   ├── trade_executor.py
-│   ├── emergency_control.py
-│   ├── news_filter_te.py
-│   ├── zone_detector.py
-│   ├── indicator_filters.py
-│   ├── candlestick_patterns.py
-│   └── ...
-├── frontend/
-│   └── src/
-├── requirements.txt
-
-
-⚡ Installation
-1️⃣ Clone the Repository
-git clone https://github.com/NawthviperCodes/currency_bot_v2.git
-cd currency_bot_v2
-
-2️⃣ Backend Setup
+```bash
 cd backend
+python -m venv venv
+venv\Scripts\activate
 pip install -r requirements.txt
-python main.py
+python api_server.py
+```
 
-3️⃣ Frontend Setup
-cd ../frontend
+The backend runs on `http://127.0.0.1:5000`.
+
+### Frontend
+
+```bash
+cd frontend
 npm install
-npm start
+npm run dev
+```
 
-📌 Versioning
+The frontend runs on the Vite URL shown in the terminal, usually `http://127.0.0.1:5173`.
 
-Current Stable Version: 2.0.0
+## Configuration
 
-Semantic Versioning (SemVer) used:
-MAJOR.MINOR.PATCH
+Edit `backend/config.json` to change:
 
-Upcoming:
+- `BotSettings.SYMBOLS` for gold symbols such as `XAUUSDz`
+- `BotSettings.DRY_RUN`
+- `BotSettings.MAGIC`
+- Strategy timeframes
+- TP ratio
+- confidence thresholds
+- risk/research settings
 
-v2.1.0 — New ATR trailing stop module
+Telegram alerts use environment variables:
 
-v3.0.0 — Multi-symbol optimized threading & portfolio mode
+```text
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
 
-📝 License
+Keep `.env` files private. They are ignored by Git.
 
-This project is licensed under the MIT License.
+## Important Notes
 
-🤝 Contributions
+- MetaTrader 5 must be installed and logged in on the machine running the backend.
+- The bot is currently configured for gold trading through broker symbols like `XAUUSDz`.
+- Large local datasets, generated CSVs, virtual environments, and `node_modules` are intentionally ignored.
+- Test on a demo account before considering any live use.
 
-Contributions, pull requests, and feature suggestions are welcome.
+## Disclaimer
 
-📩 Contact
-
-For issues or collaboration:
-NawthViperCodes – GitHub
-
-
----
+This software is provided for educational and research purposes only. Financial markets are risky, automated trading can lose money, and past results do not guarantee future performance. Use at your own risk.
 

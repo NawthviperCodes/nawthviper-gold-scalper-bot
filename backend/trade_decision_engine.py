@@ -1,37 +1,46 @@
 # ======================================================
-# === trade_decision_engine.py (Production Final) ====
+# === trade_decision_engine_v2.py ======================
 # ======================================================
-# 
-# ✅ FIX: Layer 2 Momentum Continuation (Trend Pullbacks)
-# ✅ SAFETY: "Panic Guard" to stop catching falling knives
 #
+# Simplified v2 research engine
+#
+# Built only from the Phase 1–4 findings:
+# - Phase 1C zones
+# - reversal-first
+# - tap/deep touches only
+# - no mandatory candlestick gate
+# - doji/pin bars are optional bonuses
+# - stop = beyond sweep wick + 0.15 ATR
+# - TP = fixed 2R
+#
+# Signature compatibility is preserved so existing live/backtest code can call
+# this file without structural changes.
+
+from __future__ import annotations
 
 from datetime import datetime
-import pandas as pd
 import math
-import numpy as np
-from ta.volatility import AverageTrueRange
-from performance_tracker import get_pattern_weight, is_strategy_active
+from typing import List, Optional, Tuple
 
-# Import Pattern Recognition
+from performance_tracker import is_strategy_active
 from candlestick_patterns import (
-    is_bullish_pin_bar, is_bearish_pin_bar,
-    is_bullish_engulfing, is_bearish_engulfing,
-    is_morning_star, is_evening_star,
-    is_crt_pattern_mtf
+    is_bullish_pin_bar,
+    is_bearish_pin_bar,
 )
 
 REJECTION_STATS = {
-    "Pattern Not Found": 0,
-    "Low Confidence": 0,
-    "HTF Bias Conflict": 0,
-    "Price Not In Zone": 0,
+    "Weak Quality Zone": 0,
+    "Too Many Touches": 0,
+    "No Recent Touch": 0,
+    "Full Touch Skip": 0,
+    "No Reclaim Confirmation": 0,
+    "Low RR": 0,
     "Trade Conflict": 0,
-    "Panic Guard Block": 0, # NEW STAT
-    "Other": 0
+    "Inactive Strategy": 0,
 }
 
-rejected_signals_log = []
+rejected_signals_log: List[dict] = []
+
 
 def log_rejection(reason, zone_type, zone_price, strategy, trend):
     rejected_signals_log.append({
@@ -40,353 +49,360 @@ def log_rejection(reason, zone_type, zone_price, strategy, trend):
         "zone_type": zone_type,
         "zone_price": zone_price,
         "strategy": strategy,
-        "trend": trend
+        "trend": trend,
     })
 
-def is_panic_condition(candles, side):
-    """
-    Checks if the immediate market action is crashing against the trade.
-    Returns: True if we should PANIC and BLOCK the trade.
-    """
-    if len(candles) < 5: return False
-    
-    last_c = candles.iloc[-1]
-    
-    # 1. Calculate Average Body Size (Volatility Baseline)
-    bodies = (candles['close'] - candles['open']).abs()
-    avg_body = bodies.mean()
-    
-    # 2. Check Last Candle Characteristics
-    current_body = abs(last_c['close'] - last_c['open'])
-    is_huge = current_body > (avg_body * 1.5) # Tightened: 2.0 → 1.5 catches displacement earlier
-    
-    # 3. crash Logic
+
+def _safe_atr(atr: Optional[float], current_price: float) -> float:
+    if atr is not None:
+        try:
+            atr = float(atr)
+            if not math.isnan(atr) and atr > 0:
+                return atr
+        except Exception:
+            pass
+    return max(float(current_price) * 0.0005, 1e-9)
+
+
+def _is_doji(candle) -> bool:
+    rng = float(candle.high - candle.low)
+    if rng <= 0:
+        return False
+    body = abs(float(candle.close - candle.open))
+    return body <= rng * 0.10
+
+
+def _pattern_bonus(m5_df, side: str) -> Tuple[float, str]:
+    if m5_df is None or len(m5_df) < 1:
+        return 0.0, "no_pattern"
+
+    c = m5_df.iloc[-1]
+
+    if _is_doji(c):
+        return 0.06, "doji"
+
+    if side == "buy" and is_bullish_pin_bar(c.open, c.high, c.low, c.close):
+        return 0.05, "bullish_pin_bar"
+
+    if side == "sell" and is_bearish_pin_bar(c.open, c.high, c.low, c.close):
+        return 0.05, "bearish_pin_bar"
+
+    return 0.0, "no_pattern"
+
+
+def _infer_quality(zone: dict) -> str:
+    q = str(zone.get("quality_bucket", "")).upper().strip()
+    if q in {"A", "B", "C"}:
+        return q
+
+    width_atr = float(zone.get("width_atr_ratio", 0.0) or 0.0)
+    dep_atr = float(zone.get("departure_strength_atr", 0.0) or 0.0)
+    touches = int(zone.get("touches", 0) or 0)
+
+    if dep_atr >= 2.5 and 0.20 <= width_atr <= 0.90 and touches <= 1:
+        return "A"
+    if dep_atr >= 1.6 and 0.15 <= width_atr <= 1.15 and touches <= 2:
+        return "B"
+    return "C"
+
+
+def _freshness_class(zone: dict, max_touch_allowed: int) -> str:
+    touches = int(zone.get("touches", 0) or 0)
+    if touches <= 0:
+        return "fresh"
+    if touches == 1:
+        return "first_retest"
+    if touches == 2:
+        return "second_retest"
+    if touches <= max_touch_allowed:
+        return "late_retest"
+    return "overused"
+
+
+def _classify_touch_depth(zone_bottom: float, zone_top: float, low: float, high: float, side: str) -> str:
+    width = max(zone_top - zone_bottom, 1e-9)
     if side == "buy":
-        # If we want to BUY, but the last candle was HUGE and RED (Crash)
-        if is_huge and last_c['close'] < last_c['open']:
-            return True
-    
-    if side == "sell":
-        # If we want to SELL, but the last candle was HUGE and GREEN (Pump)
-        if is_huge and last_c['close'] > last_c['open']:
-            return True
-            
-    return False
+        penetration = max(0.0, zone_top - low)
+    else:
+        penetration = max(0.0, high - zone_bottom)
+    ratio = penetration / width
+    if ratio <= 0.20:
+        return "tap"
+    if ratio <= 0.75:
+        return "deep"
+    return "full"
 
-def compute_candlestick_confidence(candles, macd=None, macd_signal=None, rsi=None, vwap=None, atr=None, htf_atr=None, m5_context=None):
-    # NOTE: macd, rsi, vwap params kept for API compatibility but no longer scored.
-    # Scoring is now: Pattern + M5 Context only.
-    score = 0.0
-    pattern_info = {"pattern": None, "side": None}
-    
-    if len(candles) < 3: return 0.0, pattern_info
-    
-    c1, c2, c3 = candles.iloc[-3], candles.iloc[-2], candles.iloc[-1]
-    
-    # --- 1. Pattern Recognition ---
-    # Weights are adaptive: static defaults until 10 trades logged, then driven by real win rate.
-    if is_bullish_engulfing(c2.open, c2.high, c2.low, c2.close, c3.open, c3.high, c3.low, c3.close):
-        pattern_info = {"pattern": "bullish_engulfing", "side": "buy"}
-        score += get_pattern_weight("bullish_engulfing", "zone_based")
-    elif is_bearish_engulfing(c2.open, c2.high, c2.low, c2.close, c3.open, c3.high, c3.low, c3.close):
-        pattern_info = {"pattern": "bearish_engulfing", "side": "sell"}
-        score += get_pattern_weight("bearish_engulfing", "zone_based")
 
-    elif is_bullish_pin_bar(c3.open, c3.high, c3.low, c3.close):
-        pattern_info = {"pattern": "bullish_pin_bar", "side": "buy"}
-        score += get_pattern_weight("bullish_pin_bar", "zone_based")
-    elif is_bearish_pin_bar(c3.open, c3.high, c3.low, c3.close):
-        pattern_info = {"pattern": "bearish_pin_bar", "side": "sell"}
-        score += get_pattern_weight("bearish_pin_bar", "zone_based")
+def _recent_touch_context(m5_df, zone_bottom: float, zone_top: float, side: str, lookback: int = 15):
+    if m5_df is None or len(m5_df) == 0:
+        return None
 
-    elif is_morning_star(c1, c2, c3):
-        pattern_info = {"pattern": "morning_star", "side": "buy"}
-        score += get_pattern_weight("morning_star", "zone_based")
-    elif is_evening_star(c1, c2, c3):
-        pattern_info = {"pattern": "evening_star", "side": "sell"}
-        score += get_pattern_weight("evening_star", "zone_based")
+    recent = m5_df.tail(lookback).copy()
+    touched_mask = (recent["high"] >= zone_bottom) & (recent["low"] <= zone_top)
+    touched = recent[touched_mask]
+    if touched.empty:
+        return None
 
-    if not pattern_info["side"]: return 0.0, pattern_info
+    touch_low = float(touched["low"].min())
+    touch_high = float(touched["high"].max())
+    depth = _classify_touch_depth(zone_bottom, zone_top, touch_low, touch_high, side)
 
-    # 🧠 PATTERN KILL SWITCH — disabled per backtest evidence
-    # morning_star: 17% WR on XAUUSDz across 5 years (12 trades, -$2101)
-    # bearish_pin_bar: 0% WR (2 trades — small sample but consistent failure)
-    # To re-enable a pattern, remove it from this set and re-backtest.
-    DISABLED_PATTERNS = {"morning_star", "bearish_pin_bar"}
-    if pattern_info.get("pattern") in DISABLED_PATTERNS:
-        return 0.0, {"pattern": None, "side": None}
+    return {
+        "touch_count_recent": int(len(touched)),
+        "touch_low": touch_low,
+        "touch_high": touch_high,
+        "touch_depth": depth,
+        "sweep_wick": touch_low if side == "buy" else touch_high,
+        "last_touch_candle": touched.iloc[-1],
+        "recent_df": recent,
+        "touched_df": touched,
+    }
 
-    # --- 2. Confluence Checks ---
-    side = pattern_info["side"]
-    
-    if m5_context:
-        m5_trend = m5_context.get('trend')
-        if (side == "buy" and m5_trend == "uptrend") or (side == "sell" and m5_trend == "downtrend"):
-            score += 0.10
-        elif (side == "buy" and m5_trend == "downtrend") or (side == "sell" and m5_trend == "uptrend"):
-            score -= 0.15 
 
-    return min(1.0, score), pattern_info
+def _simple_reclaim_confirmation(m5_df, zone_bottom: float, zone_top: float, side: str) -> Tuple[bool, str]:
+    if m5_df is None or len(m5_df) < 2:
+        return False, "not_enough_m5"
+
+    c_prev = m5_df.iloc[-2]
+    c_last = m5_df.iloc[-1]
+    zone_mid = (zone_top + zone_bottom) / 2.0
+
+    if side == "buy":
+        ok = (
+            c_last.close > c_last.open and
+            c_last.close > zone_mid and
+            c_last.close > c_prev.close
+        )
+        return ok, ("buy_reclaim" if ok else "no_buy_reclaim")
+
+    ok = (
+        c_last.close < c_last.open and
+        c_last.close < zone_mid and
+        c_last.close < c_prev.close
+    )
+    return ok, ("sell_reclaim" if ok else "no_sell_reclaim")
+
+
+def _trend_bonus(m5_context, side: str) -> float:
+    if not m5_context:
+        return 0.0
+    m5_trend = m5_context.get("trend")
+    if side == "buy" and m5_trend == "uptrend":
+        return 0.04
+    if side == "sell" and m5_trend == "downtrend":
+        return 0.04
+    if side == "buy" and m5_trend == "downtrend":
+        return -0.02
+    if side == "sell" and m5_trend == "uptrend":
+        return -0.02
+    return 0.0
+
+
+def _htf_soft_bonus(htf_bias: str, side: str) -> float:
+    if side == "buy" and htf_bias == "UP":
+        return 0.03
+    if side == "sell" and htf_bias == "DOWN":
+        return 0.03
+    if side == "buy" and htf_bias == "DOWN":
+        return -0.02
+    if side == "sell" and htf_bias == "UP":
+        return -0.02
+    return 0.0
+
+
+def _build_signal(
+    symbol: str,
+    side: str,
+    current_price: float,
+    zone: dict,
+    touch_ctx: dict,
+    atr_val: float,
+    tp_ratio: float,
+    strategy_name: str,
+    reason: str,
+    confidence: float,
+):
+    entry_price = float(current_price)
+    wick = float(touch_ctx["sweep_wick"])
+    stop_buffer = atr_val * 0.15
+
+    if side == "buy":
+        sl = wick - stop_buffer
+        risk = entry_price - sl
+        if risk <= 0:
+            return None
+        tp = entry_price + risk * tp_ratio
+    else:
+        sl = wick + stop_buffer
+        risk = sl - entry_price
+        if risk <= 0:
+            return None
+        tp = entry_price - risk * tp_ratio
+
+    return {
+        "side": side,
+        "entry": entry_price,
+        "sl": sl,
+        "tp": tp,
+        "zone": {"mid": float(zone.get("price", (zone["top"] + zone["bottom"]) / 2.0))},
+        "strategy": strategy_name,
+        "reason": reason,
+        "confidence": round(min(max(confidence, 0.0), 0.95), 4),
+    }
 
 
 def run_trade_decision_engine(
     symbol, point, current_price, trend, demand_zones, supply_zones,
     fast_demand_zones=[], fast_supply_zones=[],
     m1_candles_for_crt=None, m5_candles_for_patterns=None,
-    active_trades=None, zone_touch_counts=None, SL_BUFFER=0, TP_RATIO=1.5, CHECK_RANGE=0, LOT_SIZE=0.01, MAGIC=0,
-    strategy_mode="trend_follow",
-    macd=None, macd_signal=None, rsi=None, vwap=None, atr=None,htf_atr=None,
-    m5_context=None, htf_high=None, htf_low=None, last_closed_h1=None, 
-    fibo_zone=None, bollinger_bands=None, htf_bias="NEUTRAL", thresholds={},
-    adr_pct=0.0 # 🚀 ADDED ADR INPUT
+    active_trades=None, zone_touch_counts=None,
+    SL_BUFFER=0, TP_RATIO=1.5, CHECK_RANGE=0, LOT_SIZE=0.01, MAGIC=0,
+    strategy_mode="zone_reversal_v2",
+    macd=None, macd_signal=None, rsi=None, vwap=None,
+    atr=None, htf_atr=None,
+    m5_context=None, htf_high=None, htf_low=None, last_closed_h1=None,
+    fibo_zone=None, bollinger_bands=None,
+    htf_bias="NEUTRAL", thresholds={}
 ):
     signals = []
-    T_CONF = thresholds.get('MIN_CONFIDENCE_FOR_TRADE', 0.60)
-    T_CRT_MOM = thresholds.get('CRT_MIN_MOMENTUM', 0.25)
-    
-    # --- 1. Layer 1 Logic (Original) ---
-    try:
-        if len(m1_candles_for_crt) >= 3 and htf_high and htf_low:
-            c2, c3 = m1_candles_for_crt.iloc[-2], m1_candles_for_crt.iloc[-1]
-            crt_sig = is_crt_pattern_mtf(c2, c3, htf_high, htf_low, min_momentum=T_CRT_MOM)
-            
-            if crt_sig:
-                if (htf_bias == "UP" and crt_sig['side'] == "buy") or \
-                   (htf_bias == "DOWN" and crt_sig['side'] == "sell"):
-                    
-                    # 🛡️ PANIC CHECK 🛡️
-                    if is_panic_condition(m5_candles_for_patterns, crt_sig['side']):
-                         log_rejection("Panic Guard Block", "Structure", htf_high, strategy_mode, trend)
-                         REJECTION_STATS["Panic Guard Block"] += 1
-                    else:
-                        signals.append({
-                            "side": crt_sig['side'],
-                            "entry": crt_sig['entry_trigger'],
-                            "sl": crt_sig['sl'],
-                            "tp": crt_sig['tp'],
-                            "zone": "MTF_Structure",
-                            "strategy": "MTF_CRT",
-                            "reason": crt_sig['pattern'],
-                            "confidence": 0.95
-                        })
-                        return signals, [] 
-    except Exception:
-        pass
 
-    # --- 2. Zone-Based Logic ---
-    all_zones = [("demand", demand_zones), ("supply", supply_zones)]
-    
-    if len(m5_candles_for_patterns) < 5: return [], []
-    c_last = m5_candles_for_patterns.iloc[-1]
-    
-    for zone_type, zones in all_zones:
-        desired_side = "buy" if zone_type == "demand" else "sell"
-        
-        if htf_bias == "UP" and desired_side == "sell": 
-            log_rejection("HTF Bias Conflict", zone_type, None, strategy_mode, trend)
-            REJECTION_STATS["HTF Bias Conflict"]+= 1; continue
-        if htf_bias == "DOWN" and desired_side == "buy": 
-            log_rejection("HTF Bias Conflict", zone_type, None, strategy_mode, trend)
-            REJECTION_STATS["HTF Bias Conflict"]+= 1; continue
-        
+    if m5_candles_for_patterns is None or len(m5_candles_for_patterns) < 2:
+        return [], []
+
+    atr_val = _safe_atr(atr, current_price)
+    max_touch_allowed = int(thresholds.get("MAX_TOUCH_ALLOWED", 2))
+    rr_min = float(thresholds.get("MIN_RR_FILTER", 1.30))
+
+    for zone_type, zones in [("demand", demand_zones), ("supply", supply_zones)]:
+        side = "buy" if zone_type == "demand" else "sell"
+
         for zone in zones:
-            zone_top, zone_bottom = zone.get("top"), zone.get("bottom")
-            if not zone_top or not zone_bottom: continue
-
-            z_price = (zone_top + zone_bottom) / 2
-            zone_width = abs(zone_top - zone_bottom)
-
-            # 🧠 ZONE STRENGTH FILTER — skip thin zones with no structure
-            atr_val_now = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
-            if zone_width < atr_val_now * 0.5:
+            zone_bottom = float(zone.get("bottom", 0.0))
+            zone_top = float(zone.get("top", 0.0))
+            if zone_top <= zone_bottom:
                 continue
 
-            # 🧠 STRUCTURE FILTER — zone must have between 1 and MAX_TOUCH_ALLOWED touches
-            # < 1 = untested, no edge proven yet
-            # > max = overused zone, institutional liquidity likely exhausted
-            zone_touches = zone.get("touches", 0)
-            max_touches  = thresholds.get("MAX_TOUCH_ALLOWED", 3)
-            if zone_touches < 1 or zone_touches > max_touches:
+            quality = _infer_quality(zone)
+            if quality not in {"A", "B"}:
+                REJECTION_STATS["Weak Quality Zone"] += 1
+                log_rejection("Weak Quality Zone", zone_type, zone.get("price"), strategy_mode, trend)
                 continue
 
-            buffer = max(htf_atr * 0.5, zone_width * 0.25) if (htf_atr and not math.isnan(htf_atr)) else zone_width * 0.25
+            zone_touches = int(zone.get("touches", 0) or 0)
+            if zone_touches > max_touch_allowed:
+                REJECTION_STATS["Too Many Touches"] += 1
+                log_rejection("Too Many Touches", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-            in_zone = (zone_bottom - buffer) <= current_price <= (zone_top + buffer)
-            REJECTION_STATS["Price Not In Zone"] += 1
+            freshness_class = _freshness_class(zone, max_touch_allowed)
+            if freshness_class == "overused":
+                REJECTION_STATS["Too Many Touches"] += 1
+                log_rejection("Too Many Touches", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-            if not in_zone: continue
-            # Pattern Check
-            confidence, p_info = compute_candlestick_confidence(
+            touch_ctx = _recent_touch_context(
                 m5_candles_for_patterns,
-                macd=macd[-1] if macd is not None else None,
-                macd_signal=macd_signal[-1] if macd_signal is not None else None,
-                rsi=rsi[-1] if rsi is not None else None,
-                vwap=vwap, atr=atr, m5_context=m5_context
+                zone_bottom,
+                zone_top,
+                side,
+                lookback=15,
             )
-
-            if not p_info["side"] or p_info['side'] != desired_side:
-                log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Pattern Not Found"] += 1; continue
-
-            if confidence < T_CONF:
-                log_rejection("Low Confidence", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Low Confidence"] += 1; continue
-
-            # 🛡️ PANIC CHECK 🛡️
-            if is_panic_condition(m5_candles_for_patterns, desired_side):
-                log_rejection("Panic Guard Block", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Panic Guard Block"] += 1
+            if touch_ctx is None:
+                REJECTION_STATS["No Recent Touch"] += 1
+                log_rejection("No Recent Touch", zone_type, zone.get("price"), strategy_mode, trend)
                 continue
 
-            # 🧠 CONFIRMATION ENTRY — only enter AFTER candle confirms rejection
-            # Price must have already shown direction — not predictive guessing
-            if desired_side == "buy":
-                if c_last.close <= c_last.open:  # Need bullish close to confirm demand
-                    log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
-                    REJECTION_STATS["Pattern Not Found"] += 1; continue
-                entry_price = c_last.close
-            else:
-                if c_last.close >= c_last.open:  # Need bearish close to confirm supply
-                    log_rejection("Pattern Not Found", zone_type, z_price, strategy_mode, trend)
-                    REJECTION_STATS["Pattern Not Found"] += 1; continue
-                entry_price = c_last.close
+            if touch_ctx["touch_depth"] == "full":
+                REJECTION_STATS["Full Touch Skip"] += 1
+                log_rejection("Full Touch Skip", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-            # Trade Construction
-            atr_val = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
-            sl_dist = max(atr_val * 1.0, SL_BUFFER)
+            confirmed, confirm_reason = _simple_reclaim_confirmation(
+                m5_candles_for_patterns,
+                zone_bottom,
+                zone_top,
+                side,
+            )
+            if not confirmed:
+                REJECTION_STATS["No Reclaim Confirmation"] += 1
+                log_rejection("No Reclaim Confirmation", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-            if desired_side == "buy":
-                sl = zone_bottom - sl_dist
-                tp = entry_price + (abs(entry_price - sl) * TP_RATIO)
-            else:
-                sl = zone_top + sl_dist
-                tp = entry_price - (abs(entry_price - sl) * TP_RATIO)
+            confidence = 0.56 if quality == "B" else 0.64
 
-            # 🧠 HARD RR FILTER — only asymmetric trades survive
-            # Confirmation entry can shrink TP distance — enforce minimum 1.3R
-            rr = abs(tp - entry_price) / abs(entry_price - sl) if abs(entry_price - sl) > 0 else 0
-            if rr < 1.3:
-                log_rejection("Low Confidence", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Low Confidence"] += 1; continue
+            if freshness_class == "fresh":
+                confidence += 0.05
+            elif freshness_class == "first_retest":
+                confidence += 0.04
+            elif freshness_class == "second_retest":
+                confidence += 0.01
 
-            conflict = False
+            if touch_ctx["touch_depth"] == "tap":
+                confidence += 0.06
+            elif touch_ctx["touch_depth"] == "deep":
+                confidence += 0.03
+
+            confidence += _trend_bonus(m5_context, side)
+            confidence += _htf_soft_bonus(htf_bias, side)
+
+            pattern_bonus, pattern_name = _pattern_bonus(m5_candles_for_patterns, side)
+            confidence += pattern_bonus
+
             if active_trades and isinstance(active_trades, dict) and symbol in active_trades:
-                if active_trades[symbol]['side'] != desired_side: conflict = True
-            if conflict:
-                log_rejection("Trade Conflict", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Trade Conflict"] += 1; continue
-
-            # 🧠 KILL SWITCH: Skip if strategy is statistically underperforming
-            if not is_strategy_active(strategy_mode):
-                log_rejection("Other", zone_type, z_price, strategy_mode, trend)
-                REJECTION_STATS["Other"] += 1; continue
-
-            signals.append({
-                "side": desired_side,
-                "entry": entry_price, "sl": sl, "tp": tp,
-                "zone": {"mid": z_price},
-                "strategy": strategy_mode,
-                "reason": p_info['pattern'],
-                "confidence": confidence
-            })
-
-    # =================================================================
-    # === LAYER 2: MOMENTUM CONTINUATION — DISABLED FOR BACKTESTING ===
-    # =================================================================
-    # L2 is disabled until zone-based strategy proves edge (PF > 1.2).
-    # L2 continuation trades hurt stress PF first — confirmed as a leak.
-    # Re-enable by removing the early return below once baseline edge exists.
-    if not signals:
-        return signals, []
-
-    # --- L2 code preserved below, not reached until re-enabled ---
-    if False and not signals and htf_bias != "NEUTRAL":
-        L2_ATR_BUFFER  = 0.5
-        L2_SL_MULTIPLE = 1.0
-        L2_TP_RATIO    = 1.8   # raised from 1.25 — low RR was killing this layer
-        L2_CONFIDENCE  = 0.68
-        
-        if htf_bias == "UP" and trend == "uptrend":
-            target_zones = fast_demand_zones; l2_side = "buy"
-        elif htf_bias == "DOWN" and trend == "downtrend":
-            target_zones = fast_supply_zones; l2_side = "sell"
-        else:
-            return signals, []
-
-        # 🧠 TRIPLE ALIGNMENT: M5 trend must also agree with L2 direction
-        # Without this, L2 chases price into trend exhaustion
-        if m5_context:
-            m5_trend = m5_context.get('trend')
-            if l2_side == "buy"  and m5_trend != "uptrend":   return signals, []
-            if l2_side == "sell" and m5_trend != "downtrend": return signals, []
-
-        current_atr = atr if (atr and not math.isnan(atr)) else (current_price * 0.0005)
-        
-        for zone in target_zones:
-            z_price = zone.get("price")
-            if not z_price: continue
-
-            if abs(current_price - z_price) > (current_atr * L2_ATR_BUFFER): continue
-
-            # 🧠 ANTI-CHASE FILTER — skip if market already expanded
-            # If recent M5 range > 3x ATR, the move is exhausted — no edge left
-            if m5_candles_for_patterns is not None and len(m5_candles_for_patterns) >= 5:
-                recent_range = m5_candles_for_patterns['high'].max() - m5_candles_for_patterns['low'].min()
-                if recent_range > current_atr * 3:
+                if active_trades[symbol].get("side") != side:
+                    REJECTION_STATS["Trade Conflict"] += 1
+                    log_rejection("Trade Conflict", zone_type, zone.get("price"), strategy_mode, trend)
                     continue
 
-            if vwap:
-                if l2_side == "buy" and current_price < vwap: continue 
-                if l2_side == "sell" and current_price > vwap: continue 
+            if not is_strategy_active(strategy_mode):
+                REJECTION_STATS["Inactive Strategy"] += 1
+                log_rejection("Inactive Strategy", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-            # 🛡️ PANIC CHECK 🛡️
-            if is_panic_condition(m5_candles_for_patterns, l2_side):
-                log_rejection("Panic Guard Block", "L2_FastZone", z_price, strategy_mode, trend)
-                REJECTION_STATS["Panic Guard Block"] += 1
-                continue # Skip
+            reason = confirm_reason if pattern_name == "no_pattern" else f"{confirm_reason}+{pattern_name}"
+            sig = _build_signal(
+                symbol=symbol,
+                side=side,
+                current_price=current_price,
+                zone=zone,
+                touch_ctx=touch_ctx,
+                atr_val=atr_val,
+                tp_ratio=float(TP_RATIO),
+                strategy_name=strategy_mode,
+                reason=reason,
+                confidence=confidence,
+            )
+            if sig is None:
+                continue
 
-            if len(m1_candles_for_crt) >= 3:
-                c2, c3 = m1_candles_for_crt.iloc[-2], m1_candles_for_crt.iloc[-1]
-                p_info = is_crt_pattern_mtf(c2, c3, z_price, z_price, min_momentum=0.35)
-                
-                if p_info and p_info['side'] == l2_side:
-                    sl_dist = current_atr * L2_SL_MULTIPLE
-                    entry_price = current_price
-                    
-                    if l2_side == "buy":
-                        sl = entry_price - sl_dist
-                        tp = entry_price + (sl_dist * L2_TP_RATIO)
-                    else:
-                        sl = entry_price + sl_dist
-                        tp = entry_price - (sl_dist * L2_TP_RATIO)
+            risk = abs(sig["entry"] - sig["sl"])
+            reward = abs(sig["tp"] - sig["entry"])
+            rr = reward / risk if risk > 0 else 0.0
+            if rr < rr_min:
+                REJECTION_STATS["Low RR"] += 1
+                log_rejection("Low RR", zone_type, zone.get("price"), strategy_mode, trend)
+                continue
 
-                    conflict = False
-                    if active_trades and isinstance(active_trades, dict) and symbol in active_trades:
-                        if active_trades[symbol]['side'] != l2_side: conflict = True
-                    if conflict: continue
+            signals.append(sig)
 
-                    signals.append({
-                        "side": l2_side,
-                        "entry": entry_price, "sl": sl, "tp": tp,
-                        "zone": {"mid": z_price},
-                        "strategy": "momentum_continuation_L2",
-                        "reason": f"L2_{p_info['pattern']}",
-                        "confidence": L2_CONFIDENCE
-                    })
-                    break 
-
+    signals.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
     return signals, []
 
+
 def format_confidence_label(score):
-    if score >= 0.90: return "💎 ULTRA"
-    if score >= 0.80: return "🔥 HIGH"
-    if score >= 0.60: return "✅ MODERATE"
+    if score >= 0.80:
+        return "🔥 HIGH"
+    if score >= 0.65:
+        return "✅ GOOD"
+    if score >= 0.50:
+        return "🟡 VALID"
     return "⚠️ LOW"
 
+
 def print_rejection_summary():
-    print("\n===== REJECTION SUMMARY =====")
+    print("\n===== REJECTION SUMMARY (v2) =====")
     total = sum(REJECTION_STATS.values())
     for k, v in REJECTION_STATS.items():
-        pct = (v / total * 100) if total > 0 else 0
+        pct = (v / total * 100) if total > 0 else 0.0
         print(f"{k}: {v} ({pct:.1f}%)")
-    print("============================\n")
+    print("==================================\n")

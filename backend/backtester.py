@@ -1,24 +1,3 @@
-<<<<<<< HEAD
-# =========================================================
-# === backtest_runner.py (Sniper Edition: 70% Target) =====
-# =========================================================
-# 
-# ✅ SESSION FILTER: Trade only London/NY Volatility
-# ✅ ADR FILTER: Avoid trading exhausted moves
-# ✅ CONFIDENCE BOOST: Only take 0.65+ signals
-#
-
-import MetaTrader5 as mt5
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta, time
-from ta.volatility import AverageTrueRange
-from ta.trend import MACD
-from ta.momentum import RSIIndicator
-from ta.volume import VolumeWeightedAveragePrice
-
-# --- Import Your Actual Strategy Modules ---
-=======
 # ======================================================
 # === backtest_engine.py ===
 # ======================================================
@@ -49,6 +28,8 @@ import json
 import math
 import random
 import traceback
+import hashlib
+import uuid
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -60,7 +41,6 @@ from ta.trend import MACD
 from ta.momentum import RSIIndicator
 
 # === Your real modules ===
->>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 from zone_detector import detect_zones, detect_fast_zones
 from trade_decision_engine import run_trade_decision_engine
 
@@ -150,6 +130,21 @@ BT_CONFIG = {
     # ── HTF bias EMAs (must match get_htf_bias() in scalper_strategy_engine) ───
     "htf_ema_fast": 50,
     "htf_ema_slow": 200,
+
+    # ── Research / experiment tracking ────────────────────────────────────────
+    "strategy_name": "selective_branch",
+    "research_notes": "Config-driven event backtest with walk-forward, stress, Monte Carlo, PSR/DSR, and experiment metadata.",
+    "declared_trial_count": 1,  # Set >1 when comparing many parameter variants; used by DSR proxy.
+
+    # ── Optional sensitivity runner (disabled by default) ─────────────────────
+    "sensitivity": {
+        "enabled": False,
+        "param_grid": {
+            # Example:
+            # "min_confidence": [0.58, 0.60, 0.62],
+            # "sl_buffer_pips": [50, 60, 70],
+        }
+    },
 }
 
 # ── Timeframe string → CSV key map ────────────────────────────────────────────
@@ -161,186 +156,7 @@ TF_MAP = {
     "TIMEFRAME_M15": "M15",
 }
 
-# === CONFIGURATION ===
-SYMBOL = "XAUUSD" 
-TIMEFRAME_HTF = mt5.TIMEFRAME_H1
-TIMEFRAME_ENTRY = mt5.TIMEFRAME_M5
 
-<<<<<<< HEAD
-# TEST RANGE: 2025 Data
-START_DATE = datetime(2025, 1, 1) 
-END_DATE = datetime(2025, 10, 1)
-
-CAPITAL = 1000.0
-FIXED_LOT = 0.01 
-SPREAD_COST = 0.20 
-
-# 🛡️ RISK SETTINGS 🛡️
-MAX_DAILY_CONSECUTIVE_LOSSES = 2  # Tighter Leash (Stop after 2 losses)
-COOLDOWN_WIN = 15                 
-COOLDOWN_LOSS = 90                # Longer penalty for losing
-
-# 🎯 SNIPER SETTINGS 🎯
-SESSION_START = 8  # London Open (08:00)
-SESSION_END = 20   # NY Close (20:00)
-MIN_CONFIDENCE = 0.65 # Only High Quality
-ADR_PERIOD = 14
-
-def get_data(symbol, timeframe, start, end):
-    warmup_start = start - timedelta(days=20)
-    rates = mt5.copy_rates_range(symbol, timeframe, warmup_start, end)
-    
-    if rates is None or len(rates) == 0:
-        print(f"❌ Data fetch failed for {symbol}.")
-        return None
-
-    df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
-    
-    # Indicators
-    macd = MACD(df['close'])
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
-    df['rsi'] = RSIIndicator(df['close']).rsi()
-    df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-    vwap = VolumeWeightedAveragePrice(df['high'], df['low'], df['close'], df['real_volume'])
-    df['vwap'] = vwap.vwap
-    
-    df = df[df['time'] >= start]
-    return df.reset_index(drop=True)
-
-def get_daily_stats(current_time, df_m5):
-    """
-    Returns (DailyOpen, CurrentRange, ADR)
-    """
-    day_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-    todays_candles = df_m5[df_m5['time'] >= day_start]
-    
-    if len(todays_candles) == 0: return None, 0, 0
-    
-    daily_open = todays_candles.iloc[0]['open']
-    day_high = todays_candles['high'].max()
-    day_low = todays_candles['low'].min()
-    current_range = day_high - day_low
-    
-    # Estimate ADR using ATR of H1 or just simpler approximation here
-    # (In backtest we can just use the ATR column which is typically close to H1 ATR)
-    adr = todays_candles.iloc[-1]['atr'] * 24 # Rough approximation of Daily Range from M5 ATR
-    # Better: Use the last closed Daily candle if possible, but for M5 stream:
-    # We will assume ADR is approx 1500-2000 points for Gold, or dynamic:
-    
-    return daily_open, current_range, adr
-
-def run_backtest():
-    print(f"🚀 Starting SNIPER Backtest for {SYMBOL}...")
-    
-    if not mt5.initialize(): return
-    info = mt5.symbol_info(SYMBOL)
-    point = info.point if info else 0.01
-    
-    # Gold Calibration
-    SL_BUFFER = 300 * point if "XAU" in SYMBOL else 150 * point
-    CHECK_RANGE = 1000 * point if "XAU" in SYMBOL else 50 * point
-
-    print(f"⏳ Fetching Data ({START_DATE.date()} to {END_DATE.date()})...")
-    df_m1 = get_data(SYMBOL, mt5.TIMEFRAME_M1, START_DATE, END_DATE)
-    df_m5 = get_data(SYMBOL, TIMEFRAME_ENTRY, START_DATE, END_DATE)
-    df_h1 = get_data(SYMBOL, TIMEFRAME_HTF, START_DATE, END_DATE)
-    
-    if df_m5 is None: return
-
-    print(f"✅ Loaded {len(df_m5)} M5 candles. Applying SNIPER Filters...")
-
-    balance = CAPITAL
-    wins = 0
-    losses = 0
-    last_trade_time = None
-    consecutive_losses = 0
-    current_day = None
-    
-    for i in range(50, len(df_m5)):
-        curr_m5 = df_m5.iloc[i]
-        curr_time = curr_m5['time']
-        price = curr_m5['close']
-
-        # 1. New Day Reset
-        if current_day != curr_time.date():
-            current_day = curr_time.date()
-            consecutive_losses = 0 
-
-        # 2. Circuit Breaker
-        if consecutive_losses >= MAX_DAILY_CONSECUTIVE_LOSSES: continue 
-
-        # 3. 🕒 TIME OF DAY FILTER (Kill Zone)
-        if not (SESSION_START <= curr_time.hour < SESSION_END):
-            continue # Skip Asian Session / Late NY
-
-        # 4. Cooldown
-        if last_trade_time:
-            minutes_since = (curr_time - last_trade_time).total_seconds() / 60
-            required_wait = COOLDOWN_LOSS if (balance < CAPITAL) else COOLDOWN_WIN 
-            if minutes_since < required_wait: continue
-
-        # 5. Daily Trend & ADR Filter
-        daily_open, current_range_val, adr_val = get_daily_stats(curr_time, df_m5.iloc[:i+1])
-        allow_buy = True
-        allow_sell = True
-        
-        if daily_open:
-            if price < daily_open: allow_buy = False  
-            if price > daily_open: allow_sell = False 
-
-        # 🛑 ADR EXHAUSTION Check
-        # If we have moved > 80% of typical volatility, don't chase breaks
-        # Hardcoded Gold ADR Baseline ~ $25-$30 (2500-3000 points)
-        GOLD_ADR_POINTS = 2500 * point
-        if current_range_val > (GOLD_ADR_POINTS * 0.85):
-             continue # Market is exhausted for the day
-
-        if not allow_buy and not allow_sell: continue
-
-        # 6. Core Analysis
-        h1_slice = df_h1[df_h1['time'] < curr_time] 
-        if len(h1_slice) < 100: continue
-        
-        m5_slice = df_m5.iloc[i-50:i+1]
-        
-        htf_bias = get_htf_bias(h1_slice)
-        trend = calculate_trend(h1_slice.tail(100))
-        demand, supply = detect_zones(h1_slice.tail(200))
-        fast_demand, fast_supply = detect_fast_zones(h1_slice.tail(50))
-        
-        signals, _ = run_trade_decision_engine(
-            symbol=SYMBOL,
-            point=point,
-            current_price=price,
-            trend=trend,
-            demand_zones=demand,
-            supply_zones=supply,
-            fast_demand_zones=fast_demand,
-            fast_supply_zones=fast_supply,
-            m1_candles_for_crt=df_m1[df_m1['time'] <= curr_time].tail(3) if df_m1 is not None else pd.DataFrame(),
-            m5_candles_for_patterns=m5_slice.tail(5),
-            active_trades={},
-            zone_touch_counts={},
-            SL_BUFFER=SL_BUFFER,
-            TP_RATIO=1.5,
-            CHECK_RANGE=CHECK_RANGE,
-            LOT_SIZE=FIXED_LOT,
-            MAGIC=123,
-            strategy_mode="backtest_sniper",
-            macd=m5_slice['macd'].values, 
-            macd_signal=m5_slice['macd_signal'].values, 
-            rsi=m5_slice['rsi'].values, 
-            vwap=curr_m5['vwap'], 
-            atr=curr_m5['atr'],
-            htf_atr=h1_slice.iloc[-1]['atr'] if 'atr' in h1_slice.columns else curr_m5['atr'],
-            m5_context={'trend': trend, 'macd': m5_slice['macd'].iloc[-1], 'rsi': m5_slice['rsi'].iloc[-1]},
-            htf_high=h1_slice.tail(24)['high'].max(),
-            htf_low=h1_slice.tail(24)['low'].min(),
-            htf_bias=htf_bias,
-            thresholds={"MIN_CONFIDENCE_FOR_TRADE": MIN_CONFIDENCE} # STRICTER
-=======
 def load_live_config(path: str = "config.json") -> dict:
     """
     Load config.json and merge strategy parameters into BT_CONFIG.
@@ -481,67 +297,11 @@ def load_csv(path: str) -> pd.DataFrame:
         df['time'] = pd.to_datetime(
             df['time'].astype(str).str.replace('.', '-', regex=False),
             format='mixed', dayfirst=False
->>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
         )
     else:
         raise ValueError(f"Cannot find date/time column in {path}.\n"
                          f"Columns found: {list(df.columns)}")
 
-<<<<<<< HEAD
-        if signals:
-            best_sig = max(signals, key=lambda x: x['confidence'])
-            side = best_sig['side']
-
-            if side == 'buy' and not allow_buy: continue
-            if side == 'sell' and not allow_sell: continue
-
-            # Execution Sim
-            entry, sl, tp = best_sig['entry'], best_sig['sl'], best_sig['tp']
-            
-            future = df_m5.iloc[i+1 : i+144] 
-            result = "OPEN"
-            exit_price = 0.0
-            
-            for _, row in future.iterrows():
-                if side == 'buy':
-                    if row['low'] <= sl: result = "LOSS"; exit_price = sl; break
-                    if row['high'] >= tp: result = "WIN"; exit_price = tp; break
-                else:
-                    if row['high'] >= sl: result = "LOSS"; exit_price = sl; break
-                    if row['low'] <= tp: result = "WIN"; exit_price = tp; break
-            
-            if result != "OPEN":
-                raw_diff = (exit_price - entry) if side == 'buy' else (entry - exit_price)
-                gross_pnl = raw_diff * 100 * FIXED_LOT
-                net_pnl = gross_pnl - SPREAD_COST
-                
-                balance += net_pnl
-                last_trade_time = curr_time
-                
-                if net_pnl > 0:
-                    wins += 1
-                    consecutive_losses = 0 
-                else:
-                    losses += 1
-                    consecutive_losses += 1 
-                
-                icon = "🟢" if net_pnl > 0 else "🔴"
-                print(f"{icon} [{curr_time}] {side.upper()} | ${net_pnl:.2f} | Streak: {consecutive_losses}")
-
-    total_trades = wins + losses
-    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-    
-    print("\n" + "="*40)
-    print(f"📊 SNIPER BACKTEST ({START_DATE.date()} - {END_DATE.date()})")
-    print("="*40)
-    print(f"Total Trades:  {total_trades}")
-    print(f"Win Rate:      {win_rate:.2f}%")
-    print(f"Wins:          {wins}")
-    print(f"Losses:        {losses}")
-    print(f"Net PnL:       ${balance - CAPITAL:.2f}")
-    print(f"Final Balance: ${balance:.2f}")
-    print("="*40)
-=======
     # Validate OHLC
     for col in ['open', 'high', 'low', 'close']:
         if col not in df.columns:
@@ -711,7 +471,110 @@ def _close_trade(trade: BacktestTrade, candle: pd.Series, close_price: float,
 # === METRICS
 # ======================================================
 
-def compute_metrics(trades: list, initial_balance: float) -> dict:
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _hash_cfg(cfg: dict) -> str:
+    try:
+        payload = json.dumps(cfg, sort_keys=True, default=str).encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
+    except Exception:
+        return "cfghash_err"
+
+
+def _trade_returns_from_closed(closed: list, initial_balance: float) -> np.ndarray:
+    if not closed:
+        return np.array([], dtype=float)
+    balance = float(initial_balance)
+    returns = []
+    for t in closed:
+        if balance <= 0:
+            returns.append(0.0)
+            balance += t.pnl
+            continue
+        r = float(t.pnl) / balance
+        returns.append(r)
+        balance += float(t.pnl)
+    return np.array(returns, dtype=float)
+
+
+def _downside_deviation(returns: np.ndarray, mar: float = 0.0) -> float:
+    if returns.size == 0:
+        return 0.0
+    downside = returns[returns < mar] - mar
+    if downside.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(downside))))
+
+
+def _risk_adjusted_stats(returns: np.ndarray, trial_count: int = 1) -> dict:
+    """
+    Trade-return based risk-adjusted stats.
+    PSR implemented directly. DSR is an approximation that deflates the observed
+    Sharpe by the expected inflation from multiple trials. Keep `declared_trial_count`
+    honest when you compare many variants.
+    """
+    out = {
+        "trade_return_mean": 0.0,
+        "trade_return_std": 0.0,
+        "trade_sharpe": 0.0,
+        "trade_sortino": 0.0,
+        "trade_skew": 0.0,
+        "trade_kurtosis": 0.0,
+        "psr_sr_gt_0": None,
+        "dsr_proxy": None,
+    }
+    n = int(returns.size)
+    if n < 2:
+        return out
+
+    mu = float(np.mean(returns))
+    sigma = float(np.std(returns, ddof=1))
+    if sigma <= 0:
+        return out
+
+    sr = mu / sigma
+    downside = _downside_deviation(returns)
+    sortino = (mu / downside) if downside > 0 else float("inf")
+
+    centered = returns - mu
+    m2 = float(np.mean(centered ** 2)) if n > 0 else 0.0
+    m3 = float(np.mean(centered ** 3)) if n > 0 else 0.0
+    m4 = float(np.mean(centered ** 4)) if n > 0 else 0.0
+    skew = (m3 / (m2 ** 1.5)) if m2 > 0 else 0.0
+    kurt = (m4 / (m2 ** 2)) if m2 > 0 else 3.0  # Pearson kurtosis
+
+    # Probabilistic Sharpe Ratio for benchmark SR*=0
+    denom_term = 1 - skew * sr + ((kurt - 1) / 4.0) * (sr ** 2)
+    if denom_term > 0 and n > 1:
+        z = (sr * math.sqrt(n - 1)) / math.sqrt(denom_term)
+        psr = _norm_cdf(z)
+    else:
+        psr = None
+
+    # Deflated Sharpe proxy: subtract expected inflation from multiple testing.
+    trials = max(int(trial_count or 1), 1)
+    if trials > 1 and n > 1:
+        inflation = math.sqrt(2.0 * math.log(trials)) / math.sqrt(max(n - 1, 1))
+        dsr_proxy = _norm_cdf((sr - inflation) * math.sqrt(max(n - 1, 1)))
+    else:
+        dsr_proxy = psr
+
+    out.update({
+        "trade_return_mean": round(mu, 6),
+        "trade_return_std": round(sigma, 6),
+        "trade_sharpe": round(sr, 4),
+        "trade_sortino": round(sortino, 4) if math.isfinite(sortino) else "inf",
+        "trade_skew": round(skew, 4),
+        "trade_kurtosis": round(kurt, 4),
+        "psr_sr_gt_0": round(psr, 4) if psr is not None else None,
+        "dsr_proxy": round(dsr_proxy, 4) if dsr_proxy is not None else None,
+    })
+    return out
+
+
+def compute_metrics(trades: list, initial_balance: float, cfg: Optional[dict] = None) -> dict:
     """Full performance metrics from a list of closed BacktestTrade objects."""
     closed = [t for t in trades if t.status == "closed"]
     if not closed:
@@ -759,7 +622,10 @@ def compute_metrics(trades: list, initial_balance: float) -> dict:
     final_balance = initial_balance + sum(pnls)
     net_return_pct = (final_balance - initial_balance) / initial_balance * 100
 
-    return {
+    returns = _trade_returns_from_closed(closed, initial_balance)
+    risk_stats = _risk_adjusted_stats(returns, trial_count=(cfg or {}).get("declared_trial_count", 1))
+
+    metrics = {
         "total_trades":       total_trades,
         "wins":               win_count,
         "losses":             loss_count,
@@ -778,6 +644,17 @@ def compute_metrics(trades: list, initial_balance: float) -> dict:
         "max_drawdown_pct":   round(max_dd_pct, 2),
         "max_consec_losses":  max_consec,
     }
+    metrics.update(risk_stats)
+
+    if cfg is not None:
+        metrics.update({
+            "strategy_name": cfg.get("strategy_name", "unknown"),
+            "experiment_id": cfg.get("experiment_id"),
+            "config_hash": cfg.get("config_hash"),
+            "declared_trial_count": cfg.get("declared_trial_count", 1),
+        })
+
+    return metrics
 
 
 def monte_carlo(trades: list, initial_balance: float, runs: int = 1000) -> dict:
@@ -808,7 +685,7 @@ def monte_carlo(trades: list, initial_balance: float, runs: int = 1000) -> dict:
     dd_arr  = np.array(max_drawdowns)
     bal_arr = np.array(final_balances)
 
-    return {
+    metrics = {
         "mc_runs":             runs,
         "mc_max_dd_median":    round(float(np.median(dd_arr)), 2),
         "mc_max_dd_95th_pct":  round(float(np.percentile(dd_arr, 95)), 2),
@@ -816,7 +693,7 @@ def monte_carlo(trades: list, initial_balance: float, runs: int = 1000) -> dict:
         "mc_survival_rate":    round(float(np.mean(bal_arr > 0)) * 100, 1),
         "mc_final_bal_median": round(float(np.median(bal_arr)), 2),
     }
-
+    return metrics
 
 # ======================================================
 # === CORE SIMULATION
@@ -1049,7 +926,7 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
                 fast_demand_zones = fast_demand,
                 fast_supply_zones = fast_supply,
                 m1_candles_for_crt    = m1_window.iloc[-3:],
-                m5_candles_for_patterns = m5_window.iloc[-5:],
+                m5_candles_for_patterns = m5_window.iloc[-15:],
                 active_trades = {},
                 zone_touch_counts = {},
                 SL_BUFFER     = sl_buffer,
@@ -1205,13 +1082,14 @@ def run_walk_forward(symbol: str, tfs: dict, cfg: dict) -> list:
 # === OUTPUT & REPORTING
 # ======================================================
 
-def save_trades_csv(trades: list, path: str):
-    """Save all trades to CSV — feeds your learning system."""
+def save_trades_csv(trades: list, path: str, cfg: Optional[dict] = None):
+    """Save all trades to CSV — feeds your learning system and preserves experiment metadata."""
     if not trades: return
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
+            'experiment_id', 'strategy_name', 'config_hash',
             'symbol', 'side', 'open_time', 'close_time',
             'entry', 'close_price', 'sl', 'tp',
             'lot', 'pnl', 'result', 'close_reason',
@@ -1219,6 +1097,7 @@ def save_trades_csv(trades: list, path: str):
         ])
         for t in trades:
             writer.writerow([
+                (cfg or {}).get('experiment_id'), (cfg or {}).get('strategy_name'), (cfg or {}).get('config_hash'),
                 t.symbol, t.side, t.open_time, t.close_time,
                 round(t.entry, 5), round(t.close_price, 5),
                 round(t.sl, 5), round(t.tp, 5),
@@ -1227,9 +1106,21 @@ def save_trades_csv(trades: list, path: str):
             ])
 
 
-def save_metrics_json(metrics: dict, mc: dict, path: str):
+def save_metrics_json(metrics: dict, mc: dict, path: str, cfg: dict = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if metrics is None:
+        metrics = {}
+    if mc is None:
+        mc = {}
+
     combined = {**metrics, **mc}
+
+    if cfg is not None:
+        combined["config_symbols"] = cfg.get("symbols", [])
+        combined["config_tp_ratio"] = cfg.get("tp_ratio")
+        combined["config_min_confidence"] = cfg.get("min_confidence")
+
     with open(path, 'w') as f:
         json.dump(combined, f, indent=4)
 
@@ -1257,6 +1148,15 @@ def print_report(symbol: str, metrics: dict, mc: dict):
         print(f"  95th pct DD:    {mc['mc_max_dd_95th_pct']}%")
         print(f"  Worst DD:       {mc['mc_max_dd_worst']}%")
         print(f"  Survival Rate:  {mc['mc_survival_rate']}%")
+
+    if metrics.get('trade_sharpe') is not None:
+        print(f"\n  ── Research Stats ──")
+        print(f"  Trade Sharpe:    {metrics.get('trade_sharpe')}")
+        print(f"  Trade Sortino:   {metrics.get('trade_sortino')}")
+        print(f"  PSR (SR>0):      {metrics.get('psr_sr_gt_0')}")
+        print(f"  DSR Proxy:       {metrics.get('dsr_proxy')}")
+        print(f"  Config Hash:     {metrics.get('config_hash')}")
+        print(f"  Experiment ID:   {metrics.get('experiment_id')}")
 
     # Verdict
     print(f"\n  ── Verdict ──")
@@ -1304,16 +1204,83 @@ def stress_test(symbol: str, tfs: dict, cfg: dict) -> dict:
 
 
 # ======================================================
-# === MAIN
+# === OPTIONAL SENSITIVITY RUNNER
 # ======================================================
+
+def _iter_param_grid(param_grid: dict):
+    if not param_grid:
+        yield {}
+        return
+    keys = list(param_grid.keys())
+    def rec(i, acc):
+        if i == len(keys):
+            yield dict(acc)
+            return
+        k = keys[i]
+        for v in param_grid[k]:
+            acc[k] = v
+            yield from rec(i + 1, acc)
+    yield from rec(0, {})
+
+
+def run_sensitivity_grid(base_cfg: dict):
+    grid_cfg = base_cfg.get('sensitivity', {})
+    if not grid_cfg.get('enabled'):
+        return None
+
+    grid = grid_cfg.get('param_grid', {})
+    variants = list(_iter_param_grid(grid))
+    if not variants:
+        return None
+
+    results = []
+    print(f"\n[Research] Running sensitivity grid with {len(variants)} variants...")
+    for idx, overrides in enumerate(variants, 1):
+        cfg = dict(base_cfg)
+        cfg.update(overrides)
+        cfg['declared_trial_count'] = len(variants)
+        cfg['experiment_id'] = base_cfg['experiment_id'] + f"_g{idx:03d}"
+        cfg['config_hash'] = _hash_cfg({k: v for k, v in cfg.items() if k not in {'experiment_id', 'config_hash'}})
+
+        row = {'experiment_id': cfg['experiment_id'], 'config_hash': cfg['config_hash'], **overrides}
+        # aggregate simple robustness score across symbols
+        total_pf = 0.0
+        total_trades = 0
+        symbols_run = 0
+        for symbol in cfg['symbols']:
+            tfs = build_multi_tf(symbol, cfg['data_dir'])
+            if not tfs:
+                continue
+            trades = run_walk_forward(symbol, tfs, cfg) if cfg['walk_forward']['enabled'] else run_simulation(symbol, tfs, cfg)[0]
+            m = compute_metrics(trades, cfg['initial_balance'], cfg)
+            total_pf += float(m.get('profit_factor', 0) or 0)
+            total_trades += int(m.get('total_trades', 0) or 0)
+            symbols_run += 1
+        row['avg_pf'] = round(total_pf / symbols_run, 4) if symbols_run else None
+        row['total_trades'] = total_trades
+        results.append(row)
+        print(f"[Research] Variant {idx}/{len(variants)} → avg_pf={row['avg_pf']} trades={row['total_trades']} overrides={overrides}")
+
+    out = os.path.join(base_cfg['output_dir'], 'sensitivity_grid_results.csv')
+    pd.DataFrame(results).to_csv(out, index=False)
+    print(f"[Research] Sensitivity grid saved to {out}")
+    return results
+
 
 def main():
     # Load config.json as single source of truth, merged with backtest-only settings
     cfg = load_live_config("config.json")
+    cfg['experiment_id'] = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ') + '_' + uuid.uuid4().hex[:8]
+    cfg['config_hash'] = _hash_cfg({k: v for k, v in cfg.items() if k not in {'experiment_id', 'config_hash'}})
     print(f"  [Config] Loaded config.json")
     print(f"  [Config] Symbols:     {cfg['symbols']}")
     print(f"  [Config] TP Ratio:    {cfg['tp_ratio']} | Partial Close: {cfg['partial_close_pct']}")
     print(f"  [Config] Min Conf:    {cfg['min_confidence']} | TF Zone: {cfg['tf_zone']} | TF HTF: {cfg['tf_htf']}")
+    print(f"  [Config] Strategy:    {cfg.get('strategy_name')} | Experiment: {cfg['experiment_id']} | Hash: {cfg['config_hash']}")
+
+    if cfg.get('sensitivity', {}).get('enabled'):
+        run_sensitivity_grid(cfg)
+        return
 
     data_dir   = cfg['data_dir']
     output_dir = cfg['output_dir']
@@ -1361,8 +1328,13 @@ def main():
                     w.writerow([ep.idx, ep.time, round(ep.balance, 2),
                                  round(ep.equity, 2), round(ep.drawdown, 2)])
 
-        metrics = compute_metrics(trades, cfg['initial_balance'])
+        metrics = compute_metrics(trades, cfg['initial_balance'], cfg)
         mc      = monte_carlo(trades, cfg['initial_balance'], cfg['monte_carlo_runs'])
+        
+        if metrics is None:
+           metrics = {}
+        if mc is None:
+            mc = {}
 
         # --- Stress test ---
         stress_metrics = stress_test(symbol, tfs, cfg)
@@ -1370,8 +1342,8 @@ def main():
         # --- Save outputs ---
         trades_path  = os.path.join(output_dir, f"{symbol}_trades.csv")
         metrics_path = os.path.join(output_dir, f"{symbol}_metrics.json")
-        save_trades_csv(trades, trades_path)
-        save_metrics_json(metrics, mc, metrics_path)
+        save_trades_csv(trades, trades_path, cfg)
+        save_metrics_json(metrics, mc, metrics_path, cfg)
 
         # --- Print report ---
         print_report(symbol, metrics, mc)
@@ -1421,10 +1393,17 @@ def main():
     # Save master summary
     summary_path = os.path.join(output_dir, "summary.json")
     with open(summary_path, 'w') as f:
-        json.dump({s: r['metrics'] for s, r in all_symbol_results.items()}, f, indent=4)
+        json.dump({
+            'experiment': {
+                'experiment_id': cfg.get('experiment_id'),
+                'strategy_name': cfg.get('strategy_name'),
+                'config_hash': cfg.get('config_hash'),
+                'declared_trial_count': cfg.get('declared_trial_count', 1),
+            },
+            'results': {s: r['metrics'] for s, r in all_symbol_results.items()}
+        }, f, indent=4, default=str)
     print(f"  Results saved to: {output_dir}/")
 
->>>>>>> 03b255c (v3: upgraded trading engine, improved performance tracking, refactored backtesting module)
 
 if __name__ == "__main__":
     main()
