@@ -1,133 +1,129 @@
 import csv
 import os
-from datetime import datetime
-import uuid
+import threading
+from datetime import datetime, timezone
 
-# Unified log file (single source of truth)
-LOG_FILE = "trades_history_local.csv"
+
+LOG_FILE = "demo_validation_trades.csv"
+_LOG_LOCK = threading.Lock()
 
 HEADER = [
-    "trade_id", "timestamp", "symbol", "strategy", "side", "entry_reason", "zone_price",
-    "entry_price", "sl", "tp", "lot_size", "exit_price", "exit_time", "profit", "result"
+    "trade_id", "position_id", "open_time_utc", "close_time_utc",
+    "symbol", "strategy", "side", "entry_reason", "zone_price",
+    "zone_quality", "htf_bias", "confidence", "signal_price",
+    "actual_fill_price", "slippage_price", "sl", "tp", "lot_size",
+    "initial_risk_price", "initial_risk_cash", "exit_price",
+    "close_reason", "profit", "realized_r", "result",
 ]
 
-def log_pending_trade(strategy, side, reason, zone, entry, sl, tp, lot, symbol="", trade_id=None):
-    """Log a newly opened trade into the CSV.
-       trade_id should be the MT5 ticket. Falls back to uuid if not provided (e.g. DRY_RUN).
-    """
-    trade_id = str(trade_id) if trade_id else str(uuid.uuid4())[:8]
 
+def _timestamp(value=None):
+    if value is None:
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)
+
+
+def _adverse_slippage(side, signal_price, actual_fill_price):
+    signal_price = float(signal_price)
+    actual_fill_price = float(actual_fill_price)
+    return (
+        actual_fill_price - signal_price
+        if str(side).lower() == "buy"
+        else signal_price - actual_fill_price
+    )
+
+
+def log_pending_trade(
+    *, trade_id, position_id, open_time, symbol, strategy, side, reason,
+    zone_price, zone_quality, htf_bias, confidence, signal_price,
+    actual_fill_price, sl, tp, lot_size, initial_risk_cash,
+):
+    """Persist the complete immutable entry snapshot for demo validation."""
     row = {
-        "trade_id": trade_id,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "trade_id": str(trade_id),
+        "position_id": str(position_id),
+        "open_time_utc": _timestamp(open_time),
+        "close_time_utc": "",
         "symbol": symbol,
         "strategy": strategy,
         "side": side,
         "entry_reason": reason,
-        "zone_price": zone,
-        "entry_price": entry,
-        "sl": sl,
-        "tp": tp,
-        "lot_size": lot,
+        "zone_price": zone_price,
+        "zone_quality": zone_quality,
+        "htf_bias": htf_bias,
+        "confidence": float(confidence),
+        "signal_price": float(signal_price),
+        "actual_fill_price": float(actual_fill_price),
+        "slippage_price": _adverse_slippage(side, signal_price, actual_fill_price),
+        "sl": float(sl),
+        "tp": float(tp),
+        "lot_size": float(lot_size),
+        "initial_risk_price": abs(float(actual_fill_price) - float(sl)),
+        "initial_risk_cash": abs(float(initial_risk_cash)),
         "exit_price": "",
-        "exit_time": "",
+        "close_reason": "",
         "profit": "",
-        "result": ""
+        "realized_r": "",
+        "result": "",
     }
 
-    file_exists = os.path.isfile(LOG_FILE)
-    with open(LOG_FILE, mode="a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=HEADER)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-    return trade_id
-
-
-def get_contract_size(symbol):
-    """Return contract size approximation based on instrument."""
-    symbol = (symbol or "").upper()
-    if symbol.startswith("XAU"):  # Gold
-        return 100  # 1 lot = 100 oz
-    if symbol.startswith("XAG"):  # Silver
-        return 5000  # 1 lot = 5000 oz
-    if symbol.endswith("USD") or symbol.startswith("USD"):  # Forex majors/minors
-        return 100000  # standard forex contract size
-    if symbol.startswith("US30") or symbol.startswith("DJI"):
-        return 1  # index CFD per lot
-    if symbol.startswith("NAS") or symbol.startswith("NDX"):
-        return 20  # Nasdaq CFD approx.
-    if symbol.startswith("SPX") or symbol.startswith("S&P"):
-        return 50  # S&P CFD approx.
-    # default
-    return 100000
-
-
-def calculate_profit(entry_price, exit_price, side, lot_size, symbol="", contract_size=None):
-    """Approximate profit calculation in account currency."""
-    try:
-        entry_price = float(entry_price)
-        exit_price = float(exit_price)
-        lot_size = float(lot_size)
-    except:
-        return 0.0
-
-    if contract_size is None:
-        contract_size = get_contract_size(symbol)
-
-    points = (exit_price - entry_price)
-    if side == "sell":
-        points = -points
-    profit = points * lot_size * contract_size
-    return profit
+    with _LOG_LOCK:
+        exists = os.path.isfile(LOG_FILE)
+        if exists:
+            with open(LOG_FILE, "r", newline="", encoding="utf-8") as handle:
+                if any(
+                    existing.get("position_id") == row["position_id"]
+                    for existing in csv.DictReader(handle)
+                ):
+                    return row["position_id"]
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=HEADER)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+    return row["position_id"]
 
 
 def update_trade_result(
-    trade_id=None, entry_price=None, side=None, lot_size=None, symbol="",
-    exit_price=None, profit=None, exit_time=None, result=None
+    *, position_id, exit_price, close_time, close_reason, profit, result=None,
 ):
-    """Update an existing trade in the CSV when it closes."""
+    """Close an existing entry record and calculate realized R."""
     if not os.path.exists(LOG_FILE):
-        return
+        return False
 
-    rows = []
     updated = False
+    rows = []
+    with _LOG_LOCK:
+        with open(LOG_FILE, "r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if (
+                    row.get("position_id") == str(position_id)
+                    and not row.get("close_time_utc")
+                ):
+                    risk_cash = abs(float(row.get("initial_risk_cash") or 0.0))
+                    realized_r = float(profit) / risk_cash if risk_cash > 0 else ""
+                    row.update({
+                        "close_time_utc": _timestamp(close_time),
+                        "exit_price": float(exit_price),
+                        "close_reason": close_reason,
+                        "profit": float(profit),
+                        "realized_r": realized_r,
+                        "result": result or (
+                            "win" if float(profit) > 0
+                            else "loss" if float(profit) < 0
+                            else "breakeven"
+                        ),
+                    })
+                    updated = True
+                rows.append(row)
 
-    with open(LOG_FILE, mode="r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            # --- Primary match: by trade_id (MT5 ticket) ---
-            if trade_id and row.get("trade_id") == str(trade_id) and row.get("exit_price") in [None, "", "nan"]:
-                row['exit_price'] = str(exit_price)
-                row['exit_time'] = exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                calc_profit = profit if profit is not None else calculate_profit(
-                    row['entry_price'], exit_price, row['side'], row['lot_size'], row.get('symbol', symbol)
-                )
-                row['profit'] = str(calc_profit)
-                row['result'] = result or ("win" if float(calc_profit) > 0 else ("loss" if float(calc_profit) < 0 else "breakeven"))
-                updated = True
-
-            # --- Backup match: if no ticket, match on symbol + side + entry_price tolerance ---
-            elif (not trade_id or row.get("trade_id") in [None, "", "nan"]) and row.get("exit_price") in [None, "", "nan"]:
-                try:
-                    if row.get("symbol") == symbol and row.get("side") == side:
-                        if abs(float(row['entry_price']) - float(entry_price)) < 0.001:  # tolerance
-                            row['exit_price'] = str(exit_price)
-                            row['exit_time'] = exit_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            calc_profit = profit if profit is not None else calculate_profit(
-                                row['entry_price'], exit_price, row['side'], row['lot_size'], row.get('symbol', symbol)
-                            )
-                            row['profit'] = str(calc_profit)
-                            row['result'] = result or ("win" if float(calc_profit) > 0 else ("loss" if float(calc_profit) < 0 else "breakeven"))
-                            updated = True
-                except Exception:
-                    pass
-
-            rows.append(row)
-
-    if updated:
-        with open(LOG_FILE, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=HEADER)
-            writer.writeheader()
-            writer.writerows(rows)
+        if updated:
+            with open(LOG_FILE, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=HEADER)
+                writer.writeheader()
+                writer.writerows(rows)
+    return updated

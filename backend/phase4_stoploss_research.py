@@ -109,7 +109,14 @@ def load_runtime_config(args) -> dict:
 # -------------------------------
 
 def reaction_target_distance(row: pd.Series) -> float:
-    width = float(row.get("width", row.get("zone_top") - row.get("zone_bottom")))
+    width_value = row.get("width")
+    if width_value is None or pd.isna(width_value):
+        zone_top = row.get("zone_top")
+        zone_bottom = row.get("zone_bottom")
+        if zone_top is None or zone_bottom is None:
+            raise ValueError("Stop study requires either width or both zone_top and zone_bottom")
+        width_value = float(zone_top) - float(zone_bottom)
+    width = float(width_value)
     atr = float(row.get("atr_at_formation", 0.0) or 0.0)
     return max(width, atr * 0.50, 1e-9)
 
@@ -138,9 +145,19 @@ def make_stop_models(row: pd.Series, touch_candle: pd.Series, cfg: dict) -> Dict
     return models
 
 
-def evaluate_stop_model(df: pd.DataFrame, touch_idx: int, row: pd.Series, entry: float, stop: float, horizon: int, cfg: dict) -> Dict[str, object]:
+def evaluate_stop_model(df: pd.DataFrame, entry_idx: int, row: pd.Series, entry: float, stop: float, horizon: int, cfg: dict) -> Dict[str, object]:
+    """Evaluate a stop using only bars that exist at or after entry.
+
+    ``entry_idx`` is deliberately distinct from the zone-touch index.  The
+    touch candle must close before its completed wick can be used to construct
+    a stop, so evaluation may never begin on the touch candle itself.
+    """
     side = "buy" if row["zone_type"] == "demand" else "sell"
-    end_idx = min(len(df) - 1, touch_idx + horizon)
+    if entry_idx < 0 or entry_idx >= len(df):
+        return {"status": "invalid_entry", "r_multiple": np.nan, "false_stop": False, "target_hit": False}
+
+    # ``horizon`` means exactly N tradable bars beginning with the entry bar.
+    end_idx = min(len(df) - 1, entry_idx + max(int(horizon), 1) - 1)
     target_dist = reaction_target_distance(row)
 
     if side == "buy":
@@ -158,7 +175,7 @@ def evaluate_stop_model(df: pd.DataFrame, touch_idx: int, row: pd.Series, entry:
     target_idx = None
     ambiguous_idx = None
 
-    for j in range(touch_idx, end_idx + 1):
+    for j in range(entry_idx, end_idx + 1):
         c = df.iloc[j]
         low = float(c["low"])
         high = float(c["high"])
@@ -354,19 +371,38 @@ def run_symbol_study(symbol: str, price_df: pd.DataFrame, zones_df: pd.DataFrame
         if touch_idx < 0 or touch_idx >= len(price_df):
             continue
 
+        # Causal event clock:
+        #   touch candle completes -> signal becomes knowable -> next bar opens
+        #   -> trade enters -> stop/target evaluation begins.
+        # The completed touch wick is valid input to the stop, but the touch
+        # candle's earlier high/low can never count as post-entry performance.
+        entry_idx = touch_idx + 1
+        if entry_idx >= len(price_df):
+            continue
+
         touch_candle = price_df.iloc[touch_idx]
-        entry = float(touch_candle["close"])
+        entry_candle = price_df.iloc[entry_idx]
+        entry = float(entry_candle["open"])
         atr = float(row.get("atr_at_formation", 0.0) or 0.0)
 
         stop_models = make_stop_models(row, touch_candle, cfg)
         for model_name, stop_price in stop_models.items():
-            eval_res = evaluate_stop_model(price_df, touch_idx, row, entry, float(stop_price), horizon, cfg)
+            eval_res = evaluate_stop_model(price_df, entry_idx, row, entry, float(stop_price), horizon, cfg)
             rec = {
                 "symbol": symbol,
                 "stop_model": model_name,
                 "zone_type": row.get("zone_type"),
                 "zone_time": row.get("zone_time"),
                 "first_touch_time": row.get("first_touch_time"),
+                "touch_idx": touch_idx,
+                "touch_timestamp": touch_candle.get("time"),
+                # With bar data, the touch closes when the next bar opens.
+                # Signal and simulated entry therefore share this timestamp;
+                # a latency model can move entry later in the replay engine.
+                "signal_idx": entry_idx,
+                "signal_timestamp": entry_candle.get("time"),
+                "entry_idx": entry_idx,
+                "entry_timestamp": entry_candle.get("time"),
                 "first_touch_depth": row.get("first_touch_depth", ""),
                 "freshness_class": row.get("freshness_class", "unknown"),
                 "quality_bucket": row.get("quality_bucket", "unknown"),

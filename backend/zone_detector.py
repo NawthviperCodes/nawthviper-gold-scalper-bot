@@ -59,7 +59,10 @@ def detect_zones(
     lows = work['low'].values.astype(np.float64)
     opens = work['open'].values.astype(np.float64)
     closes = work['close'].values.astype(np.float64)
-    times = work['time'].astype('int64').values // 10**9
+    # Convert explicitly to Unix seconds.  Dividing pandas' raw int64 by 1e9
+    # assumes nanosecond storage, which is not stable across pandas versions
+    # (datetime64[us] would silently produce 1970-era timestamps).
+    times = work['time'].to_numpy(dtype='datetime64[s]').astype(np.int64)
 
     demand_rows, supply_rows = _find_zones_numba(
         highs, lows, opens, closes, atr_values, times,
@@ -194,7 +197,10 @@ def _find_zones_numba(
     supply_raw = []
 
     start = max(zone_size, 20)
-    end = n - zone_size - departure_bars
+    # Right-side pivot confirmation and departure measurement observe the
+    # same future bars.  They overlap; requiring their sum delays discovery
+    # beyond the timestamp at which all evidence is already available.
+    end = n - max(zone_size, departure_bars)
 
     for i in range(start, end):
         h = highs[i]
@@ -203,6 +209,8 @@ def _find_zones_numba(
         c = closes[i]
         a = atr[i]
         t = times[i]
+        activation_idx = i + max(zone_size, departure_bars)
+        activation_time = times[activation_idx]
 
         if a <= 0:
             continue
@@ -226,7 +234,10 @@ def _find_zones_numba(
                 dep_abs = max_dep - l
                 dep_atr = dep_abs / a if a > 0 else 0.0
                 if dep_atr >= departure_atr_mult:
-                    demand_raw.append((l, body_top, t, i, a, dep_abs, dep_atr, width, width_atr_ratio))
+                    demand_raw.append((
+                        l, body_top, t, i, a, dep_abs, dep_atr, width,
+                        width_atr_ratio, activation_idx, activation_time,
+                    ))
 
         # pivot high
         pivot_high = True
@@ -247,7 +258,10 @@ def _find_zones_numba(
                 dep_abs = h - min_dep
                 dep_atr = dep_abs / a if a > 0 else 0.0
                 if dep_atr >= departure_atr_mult:
-                    supply_raw.append((h, body_bottom, t, i, a, dep_abs, dep_atr, width, width_atr_ratio))
+                    supply_raw.append((
+                        h, body_bottom, t, i, a, dep_abs, dep_atr, width,
+                        width_atr_ratio, activation_idx, activation_time,
+                    ))
 
     return demand_raw, supply_raw
 
@@ -268,7 +282,10 @@ def _compute_atr(df: pd.DataFrame) -> np.ndarray:
 def _rows_to_zones(rows, zone_type: str) -> List[dict]:
     zones = []
     for row in rows:
-        extreme, body_edge, t, idx, atr_at_form, dep_abs, dep_atr, width, width_atr_ratio = row
+        (
+            extreme, body_edge, t, idx, atr_at_form, dep_abs, dep_atr,
+            width, width_atr_ratio, activation_idx, activation_time,
+        ) = row
         if zone_type == 'demand':
             bottom, top, price = float(extreme), float(body_edge), float(extreme)
         else:
@@ -279,8 +296,19 @@ def _rows_to_zones(rows, zone_type: str) -> List[dict]:
             'price': price,
             'bottom': bottom,
             'top': top,
+            # The pivot candle is the displacement origin: its extreme and
+            # body edge are the structural invalidation boundaries.
+            'displacement_origin_low': bottom,
+            'displacement_origin_high': top,
+            # ``created_at`` is the pivot candle.  The zone is not knowable
+            # until both right-side pivot confirmation and departure evidence
+            # have closed, represented by ``activated_at``.
             'time': pd.to_datetime(int(t), unit='s'),
+            'created_at': pd.to_datetime(int(t), unit='s'),
+            'detected_at': pd.to_datetime(int(activation_time), unit='s'),
+            'activated_at': pd.to_datetime(int(activation_time), unit='s'),
             'formation_idx': int(idx),
+            'activation_idx': int(activation_idx),
             'touches': 0,
             'tap_touches': 0,
             'deep_touches': 0,
@@ -337,11 +365,20 @@ def _merge_nearby_zones(zones: List[dict], atr_values: np.ndarray, df: pd.DataFr
 
             last['formation_idx'] = min(last['formation_idx'], z['formation_idx'])
             last['time'] = min(last['time'], z['time'])
+            last['created_at'] = min(last['created_at'], z['created_at'])
+            # A merged zone cannot exist before its latest constituent is
+            # confirmed.  Using max prevents the composite from appearing in
+            # history before all information needed to construct it exists.
+            last['activation_idx'] = max(last['activation_idx'], z['activation_idx'])
+            last['activated_at'] = max(last['activated_at'], z['activated_at'])
+            last['detected_at'] = last['activated_at']
             last['width'] = float(max(last['top'] - last['bottom'], 1e-9))
             last['atr_at_formation'] = float(max(last['atr_at_formation'], z['atr_at_formation']))
             last['width_atr_ratio'] = float(last['width'] / max(last['atr_at_formation'], 1e-9))
             last['departure_strength_abs'] = float(max(last['departure_strength_abs'], z['departure_strength_abs']))
             last['departure_strength_atr'] = float(max(last['departure_strength_atr'], z['departure_strength_atr']))
+            last['displacement_origin_low'] = float(last['bottom'])
+            last['displacement_origin_high'] = float(last['top'])
             last['merged_from_count'] += 1
         else:
             merged.append(z)
@@ -387,7 +424,9 @@ def _simulate_zone_lifecycle(
     full_touch_limit: int,
     invalidation_close_penetration: float,
 ):
-    start = int(zone['formation_idx']) + 1
+    # Confirmation/departure candles are inputs to zone creation and therefore
+    # cannot also be treated as post-activation touches or invalidations.
+    start = int(zone['activation_idx']) + 1
     n = len(df)
     width = max(float(zone['top'] - zone['bottom']), 1e-9)
 
@@ -396,7 +435,7 @@ def _simulate_zone_lifecycle(
     event_start = None
 
     for i in range(start, n):
-        zone['age_bars'] = i - zone['formation_idx']
+        zone['age_bars'] = i - zone['activation_idx']
         candle = df.iloc[i]
 
         # expire stale untouched zones

@@ -40,12 +40,17 @@ REVERSE_OUTCOMES = {"immediate_reversal", "consolidation_then_reversal"}
 BREAKOUT_OUTCOMES = {"breakout"}
 NEUTRAL_OUTCOMES = {"no_clear_reaction"}
 UNTOUCHED_OUTCOMES = {"untouched", "invalidated_before_touch"}
+CENSORED_OUTCOMES = {"right_censored"}
 
 
 def load_zones_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     # best-effort datetime parsing
-    for col in ["zone_time", "first_touch_time", "invalidated_time", "reaction_time"]:
+    for col in [
+        "zone_time", "created_at", "detection_time", "activated_at",
+        "first_touch_time", "touch_observed_at", "invalidated_time",
+        "reaction_bar_time", "reaction_evaluation_start_time", "reaction_time",
+    ]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
     return df
@@ -61,6 +66,8 @@ def derive_reaction_family(outcome: str) -> str:
         return "no_clear_reaction"
     if outcome in UNTOUCHED_OUTCOMES:
         return "untouched_or_invalidated"
+    if outcome in CENSORED_OUTCOMES:
+        return "right_censored"
     return "other"
 
 
@@ -86,28 +93,38 @@ def build_symbol_summary(symbol: str, df: pd.DataFrame) -> dict:
     total = len(df)
     touched_df = df[df["touched"] == True].copy() if "touched" in df.columns else df.copy()
     touched = len(touched_df)
+    censored_count = int(touched_df["reaction_family"].eq("right_censored").sum())
+    evaluable_df = touched_df[~touched_df["reaction_family"].eq("right_censored")].copy()
+    evaluable = len(evaluable_df)
 
-    reversal_count = int(touched_df["reaction_family"].eq("reversal").sum())
-    breakout_count = int(touched_df["reaction_family"].eq("breakout").sum())
-    no_clear_count = int(touched_df["reaction_family"].eq("no_clear_reaction").sum())
-    immediate_count = int(touched_df["reaction_outcome"].eq("immediate_reversal").sum())
-    consolid_count = int(touched_df["reaction_outcome"].eq("consolidation_then_reversal").sum())
+    reversal_count = int(evaluable_df["reaction_family"].eq("reversal").sum())
+    breakout_count = int(evaluable_df["reaction_family"].eq("breakout").sum())
+    no_clear_count = int(evaluable_df["reaction_family"].eq("no_clear_reaction").sum())
+    immediate_count = int(evaluable_df["reaction_outcome"].eq("immediate_reversal").sum())
+    consolid_count = int(evaluable_df["reaction_outcome"].eq("consolidation_then_reversal").sum())
 
     return {
         "symbol": symbol,
         "total_zones": int(total),
         "touched_zones": int(touched),
+        "evaluable_touched_zones": int(evaluable),
+        "right_censored_count": censored_count,
+        "right_censored_rate_touched_pct": safe_rate(censored_count, touched),
         "touched_pct": safe_rate(touched, total),
         "reversal_count": reversal_count,
         "breakout_count": breakout_count,
         "no_clear_count": no_clear_count,
         "immediate_reversal_count": immediate_count,
         "consolidation_reversal_count": consolid_count,
-        "reversal_rate_touched_pct": safe_rate(reversal_count, touched),
-        "breakout_rate_touched_pct": safe_rate(breakout_count, touched),
-        "no_clear_rate_touched_pct": safe_rate(no_clear_count, touched),
-        "immediate_reversal_rate_touched_pct": safe_rate(immediate_count, touched),
-        "consolidation_reversal_rate_touched_pct": safe_rate(consolid_count, touched),
+        # Compatibility keys retained, but all performance rates now use only
+        # touched zones with a complete forward observation window.
+        "reversal_rate_touched_pct": safe_rate(reversal_count, evaluable),
+        "breakout_rate_touched_pct": safe_rate(breakout_count, evaluable),
+        "no_clear_rate_touched_pct": safe_rate(no_clear_count, evaluable),
+        "immediate_reversal_rate_touched_pct": safe_rate(immediate_count, evaluable),
+        "consolidation_reversal_rate_touched_pct": safe_rate(consolid_count, evaluable),
+        "reversal_rate_evaluable_pct": safe_rate(reversal_count, evaluable),
+        "breakout_rate_evaluable_pct": safe_rate(breakout_count, evaluable),
         "avg_width_atr_ratio": round(float(pd.to_numeric(df.get("width_atr_ratio"), errors="coerce").dropna().mean()), 4) if "width_atr_ratio" in df.columns else np.nan,
         "avg_departure_strength_atr": round(float(pd.to_numeric(df.get("departure_strength_atr"), errors="coerce").dropna().mean()), 4) if "departure_strength_atr" in df.columns else np.nan,
         "avg_touches": round(float(pd.to_numeric(df.get("touches"), errors="coerce").dropna().mean()), 2) if "touches" in df.columns else np.nan,
@@ -130,19 +147,25 @@ def grouped_reaction_rates(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     rows: List[dict] = []
     for grp, g in df.groupby(group_col, dropna=False):
         touched = len(g)
-        reversal = int(g["reaction_family"].eq("reversal").sum())
-        breakout = int(g["reaction_family"].eq("breakout").sum())
-        no_clear = int(g["reaction_family"].eq("no_clear_reaction").sum())
-        immediate = int(g["reaction_outcome"].eq("immediate_reversal").sum())
-        consolid = int(g["reaction_outcome"].eq("consolidation_then_reversal").sum())
+        censored = int(g["reaction_family"].eq("right_censored").sum())
+        evaluable_g = g[~g["reaction_family"].eq("right_censored")]
+        evaluable = len(evaluable_g)
+        reversal = int(evaluable_g["reaction_family"].eq("reversal").sum())
+        breakout = int(evaluable_g["reaction_family"].eq("breakout").sum())
+        no_clear = int(evaluable_g["reaction_family"].eq("no_clear_reaction").sum())
+        immediate = int(evaluable_g["reaction_outcome"].eq("immediate_reversal").sum())
+        consolid = int(evaluable_g["reaction_outcome"].eq("consolidation_then_reversal").sum())
         rows.append({
             group_col: grp if pd.notna(grp) else "unknown",
             "count": touched,
-            "reversal_rate_pct": safe_rate(reversal, touched),
-            "breakout_rate_pct": safe_rate(breakout, touched),
-            "no_clear_rate_pct": safe_rate(no_clear, touched),
-            "immediate_reversal_rate_pct": safe_rate(immediate, touched),
-            "consolidation_reversal_rate_pct": safe_rate(consolid, touched),
+            "evaluable_count": evaluable,
+            "right_censored_count": censored,
+            "right_censored_rate_pct": safe_rate(censored, touched),
+            "reversal_rate_pct": safe_rate(reversal, evaluable),
+            "breakout_rate_pct": safe_rate(breakout, evaluable),
+            "no_clear_rate_pct": safe_rate(no_clear, evaluable),
+            "immediate_reversal_rate_pct": safe_rate(immediate, evaluable),
+            "consolidation_reversal_rate_pct": safe_rate(consolid, evaluable),
             "avg_width_atr_ratio": round(float(pd.to_numeric(g.get("width_atr_ratio"), errors="coerce").dropna().mean()), 4) if "width_atr_ratio" in g.columns else np.nan,
             "avg_departure_strength_atr": round(float(pd.to_numeric(g.get("departure_strength_atr"), errors="coerce").dropna().mean()), 4) if "departure_strength_atr" in g.columns else np.nan,
             "avg_touches": round(float(pd.to_numeric(g.get("touches"), errors="coerce").dropna().mean()), 2) if "touches" in g.columns else np.nan,
@@ -196,6 +219,8 @@ def run_symbol_reaction_study(symbol: str, df: pd.DataFrame, output_dir: str) ->
 
     print(f"  Zones:                {summary['total_zones']}")
     print(f"  Touched zones:        {summary['touched_zones']} ({summary['touched_pct']}%)")
+    print(f"  Evaluable touches:    {summary['evaluable_touched_zones']}")
+    print(f"  Right-censored:       {summary['right_censored_count']} ({summary['right_censored_rate_touched_pct']}%)")
     print(f"  Reversal rate:        {summary['reversal_rate_touched_pct']}%")
     print(f"  Immediate reversal:   {summary['immediate_reversal_rate_touched_pct']}%")
     print(f"  Consolidation rev.:   {summary['consolidation_reversal_rate_touched_pct']}%")

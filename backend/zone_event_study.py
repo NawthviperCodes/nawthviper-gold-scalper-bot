@@ -126,33 +126,77 @@ def classify_first_touch_depth(candle: pd.Series, zone: dict) -> str:
 
 
 def reaction_target(zone: dict) -> float:
-    width = max(float(zone.get('width', zone['top'] - zone['bottom'])), 1e-9)
+    width_value = zone.get('width')
+    if width_value is None or pd.isna(width_value):
+        width_value = float(zone['top']) - float(zone['bottom'])
+    width = max(float(width_value), 1e-9)
     atr = float(zone.get('atr_at_formation', 0.0) or 0.0)
     return max(width, atr * 0.50, 1e-9)
 
 
+def bar_close_timestamp(df: pd.DataFrame, idx: int) -> Optional[pd.Timestamp]:
+    """Return when bar ``idx`` became fully observable.
+
+    MT5 research files timestamp bars at their open.  The next bar's open is
+    therefore the previous bar's close.  For the final bar, infer the regular
+    interval only for audit metadata; it is never used to expose future OHLC.
+    """
+    if idx < 0 or idx >= len(df):
+        return None
+    if idx + 1 < len(df):
+        return pd.Timestamp(df.iloc[idx + 1]['time'])
+    if len(df) >= 2:
+        deltas = pd.Series(df['time']).diff().dropna()
+        if not deltas.empty:
+            return pd.Timestamp(df.iloc[idx]['time']) + deltas.median()
+    return None
+
+
 def classify_reaction(df: pd.DataFrame, touch_idx: int, zone: dict, horizon: int) -> Tuple[str, Optional[int]]:
-    end_idx = min(len(df) - 1, touch_idx + horizon)
+    """Classify only price action observable after the touch bar closes.
+
+    A touch candle's completed high/low cannot be counted as post-touch
+    reaction because their intrabar order relative to the touch is unknown.
+    The only touch-bar outcome used is close-through invalidation, which is
+    knowable when the touch bar closes.  Otherwise evaluation begins on the
+    next bar and spans exactly ``horizon`` post-touch bars.
+    """
+    if touch_idx < 0 or touch_idx >= len(df):
+        raise IndexError("touch_idx is outside the price dataframe")
+
+    horizon = max(int(horizon), 1)
     target = reaction_target(zone)
     touch_candle = df.iloc[touch_idx]
 
+    # A close through the zone on the touch bar is a confirmed breakout at
+    # that bar's close, not a tradable post-touch reversal.
+    if is_invalidated(touch_candle, zone):
+        return 'breakout', touch_idx
+
+    start_idx = touch_idx + 1
+    if start_idx >= len(df):
+        return 'right_censored', None
+    end_idx = min(len(df) - 1, start_idx + horizon - 1)
+
     if zone['type'] == 'demand':
         reversal_level = max(touch_candle['close'], zone['top']) + target
-        for j in range(touch_idx, end_idx + 1):
+        for j in range(start_idx, end_idx + 1):
             c = df.iloc[j]
             if c['close'] < zone['bottom']:
                 return 'breakout', j
             if c['high'] >= reversal_level:
-                return ('immediate_reversal' if j == touch_idx else 'consolidation_then_reversal'), j
+                return ('immediate_reversal' if j == start_idx else 'consolidation_then_reversal'), j
     else:
         reversal_level = min(touch_candle['close'], zone['bottom']) - target
-        for j in range(touch_idx, end_idx + 1):
+        for j in range(start_idx, end_idx + 1):
             c = df.iloc[j]
             if c['close'] > zone['top']:
                 return 'breakout', j
             if c['low'] <= reversal_level:
-                return ('immediate_reversal' if j == touch_idx else 'consolidation_then_reversal'), j
+                return ('immediate_reversal' if j == start_idx else 'consolidation_then_reversal'), j
 
+    if (end_idx - start_idx + 1) < horizon:
+        return 'right_censored', None
     return 'no_clear_reaction', None
 
 
@@ -201,6 +245,11 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
     active: Dict[Tuple, dict] = {}
     completed: List[dict] = []
 
+    # MT5 bar timestamps are unique in the research files.  Resolve detector
+    # metadata by timestamp because detector indices are relative to its
+    # rolling lookback window, not to the full symbol dataframe.
+    index_by_time = {pd.Timestamp(t): int(idx) for idx, t in enumerate(df['time'])}
+
     for i in range(warmup, len(df)):
         hist_start = max(0, i - history_bars + 1)
         hist = df.iloc[hist_start:i+1].copy()
@@ -211,6 +260,21 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
         current_zones = demand_zones + supply_zones
 
         for z in current_zones:
+            created_at = pd.Timestamp(z.get('created_at', z.get('time')))
+            activated_at = pd.Timestamp(z.get('activated_at', z.get('detected_at')))
+            created_idx = index_by_time.get(created_at)
+            activation_idx = index_by_time.get(activated_at)
+
+            if created_idx is None or activation_idx is None:
+                continue
+
+            # Admit a candidate exactly when it becomes knowable.  In
+            # particular, do not load zones that activated before ``warmup``
+            # and merely survived until the study started; that would select
+            # on future survival and undercount failed zones.
+            if activation_idx != i:
+                continue
+
             k = zone_key(z)
             if k in active:
                 continue
@@ -219,8 +283,13 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
             record = {
                 'symbol': symbol,
                 'zone_type': z['type'],
-                'zone_time': str(pd.to_datetime(z['time'])),
-                'formation_idx': i,
+                'zone_time': str(created_at),
+                'created_at': str(created_at),
+                'detection_time': str(df.iloc[i]['time']),
+                'activated_at': str(activated_at),
+                'formation_idx': created_idx,
+                'detection_idx': i,
+                'activation_idx': activation_idx,
                 'zone_bottom': float(z['bottom']),
                 'zone_top': float(z['top']),
                 'zone_mid': float(z['price']),
@@ -239,18 +308,23 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
                 'touched': False,
                 'first_touch_time': '',
                 'first_touch_idx': None,
+                'touch_observed_at': '',
                 'first_touch_depth': '',
                 'invalidated': False,
                 'invalidated_time': '',
                 'reaction_outcome': 'untouched',
                 'reaction_time': '',
+                'reaction_idx': None,
+                'reaction_bar_time': '',
+                'reaction_evaluation_start_idx': None,
+                'reaction_evaluation_start_time': '',
             }
             active[k] = record
 
         candle = df.iloc[i]
         to_remove = []
         for k, rec in active.items():
-            if i <= rec['formation_idx']:
+            if i <= rec['activation_idx']:
                 continue
 
             zone = {
@@ -265,14 +339,28 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
                 rec['touched'] = True
                 rec['first_touch_time'] = str(candle['time'])
                 rec['first_touch_idx'] = i
+                touch_observed_at = bar_close_timestamp(df, i)
+                rec['touch_observed_at'] = str(touch_observed_at) if touch_observed_at is not None else ''
                 rec['first_touch_depth'] = classify_first_touch_depth(candle, zone)
+
+                evaluation_start_idx = i + 1
+                rec['reaction_evaluation_start_idx'] = evaluation_start_idx
+                if evaluation_start_idx < len(df):
+                    rec['reaction_evaluation_start_time'] = str(df.iloc[evaluation_start_idx]['time'])
 
                 outcome, outcome_idx = classify_reaction(df, i, zone, horizon)
                 rec['reaction_outcome'] = outcome
                 if outcome_idx is not None:
-                    rec['reaction_time'] = str(df.iloc[outcome_idx]['time'])
+                    rec['reaction_idx'] = outcome_idx
+                    rec['reaction_bar_time'] = str(df.iloc[outcome_idx]['time'])
+                    observed_at = bar_close_timestamp(df, outcome_idx)
+                    rec['reaction_time'] = str(observed_at) if observed_at is not None else ''
+                else:
+                    evaluation_end_idx = min(len(df) - 1, i + horizon)
+                    observed_at = bar_close_timestamp(df, evaluation_end_idx)
+                    rec['reaction_time'] = str(observed_at) if observed_at is not None else ''
 
-                if outcome in ('immediate_reversal', 'consolidation_then_reversal', 'breakout', 'no_clear_reaction'):
+                if outcome in ('immediate_reversal', 'consolidation_then_reversal', 'breakout', 'no_clear_reaction', 'right_censored'):
                     completed.append(rec.copy())
                     to_remove.append(k)
                     continue
@@ -298,6 +386,12 @@ def run_symbol_study(symbol: str, df: pd.DataFrame, cfg: dict) -> Tuple[pd.DataF
         return zones_df, summarize_symbol(zones_df)
 
     zones_df['zone_time'] = pd.to_datetime(zones_df['zone_time'])
+    for col in [
+        'created_at', 'detection_time', 'activated_at', 'touch_observed_at',
+        'reaction_bar_time', 'reaction_evaluation_start_time',
+    ]:
+        if col in zones_df.columns:
+            zones_df[col] = pd.to_datetime(zones_df[col], errors='coerce')
     if 'first_touch_time' in zones_df.columns:
         zones_df['first_touch_time'] = pd.to_datetime(zones_df['first_touch_time'], errors='coerce')
     if 'invalidated_time' in zones_df.columns:

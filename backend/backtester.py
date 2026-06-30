@@ -36,13 +36,22 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from ta.volatility import AverageTrueRange
 from ta.trend import MACD
 from ta.momentum import RSIIndicator
 
 # === Your real modules ===
 from zone_detector import detect_zones, detect_fast_zones
 from trade_decision_engine import run_trade_decision_engine
+from strategies import (
+    ZoneReversalConfig,
+    build_zone_reversal_snapshot,
+    closed_bars_frame,
+    closed_bars_slice,
+    normalize_pipeline_mode,
+    run_zone_reversal_pipeline,
+    timeframe_close_delta,
+    wilder_atr,
+)
 
 # ======================================================
 # === CONFIGURATION
@@ -156,6 +165,21 @@ TF_MAP = {
     "TIMEFRAME_M15": "M15",
 }
 
+PIPELINE_PARITY = {"checks": 0, "mismatches": 0}
+
+
+def _record_pipeline_parity(report):
+    PIPELINE_PARITY["checks"] += 1
+    if report.matched:
+        return
+    PIPELINE_PARITY["mismatches"] += 1
+    count = PIPELINE_PARITY["mismatches"]
+    if count <= 5 or count % 100 == 0:
+        print(
+            f"  [Pipeline Shadow] {report.symbol} mismatch #{count} at "
+            f"{report.as_of.isoformat()} ({report.canonical_error or 'signal divergence'})"
+        )
+
 
 def load_live_config(path: str = "config.json") -> dict:
     """
@@ -174,6 +198,9 @@ def load_live_config(path: str = "config.json") -> dict:
     merged.update({
         # Symbols
         "symbols":              raw["BotSettings"]["SYMBOLS"],
+        "strategy_pipeline_mode": normalize_pipeline_mode(
+            raw["BotSettings"].get("STRATEGY_PIPELINE_MODE", "legacy")
+        ),
 
         # Timeframes — resolved via TF_MAP so run_simulation uses correct CSV keys
         "tf_zone":    TF_MAP.get(strat["TIMEFRAME_ZONE"],    "H1"),
@@ -699,7 +726,7 @@ def monte_carlo(trades: list, initial_balance: float, runs: int = 1000) -> dict:
 # === CORE SIMULATION
 # ======================================================
 
-def run_simulation(symbol: str, tfs: dict, cfg: dict,
+def _run_h1_simulation_legacy(symbol: str, tfs: dict, cfg: dict,
                    start_idx: int = 0, end_idx: int = None) -> list:
     """
     Candle-by-candle simulation over H1 data.
@@ -835,23 +862,31 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
 
         # --- 5. Build lookback windows ---
         h1_window = h1.iloc[max(0, i - 300):i+1]
+        decision_as_of = pd.Timestamp(candle['time']) + timeframe_close_delta(
+            cfg.get('tf_zone', 'H1')
+        )
 
-        # Align M5 by timestamp
+        # A replay decision occurs only after the current zone-timeframe bar
+        # closes. Lower and higher timeframes therefore use bar-close
+        # availability, never their open timestamps alone.
         if m5 is not None:
-            m5_mask   = m5['time'] <= candle['time']
-            m5_window = m5[m5_mask].tail(60)
+            m5_window = closed_bars_frame(
+                m5, timeframe=cfg.get('tf_confirm', 'M5'), as_of=decision_as_of, tail=80
+            )
         else:
-            m5_window = h1.iloc[max(0, i-60):i+1]  # Fallback: use H1
+            m5_window = h1_window.tail(80)  # Explicitly unfaithful fallback
 
         if m1 is not None:
-            m1_mask   = m1['time'] <= candle['time']
-            m1_window = m1[m1_mask].tail(200)
+            m1_window = closed_bars_frame(
+                m1, timeframe=cfg.get('tf_entry', 'M1'), as_of=decision_as_of, tail=200
+            )
         else:
             m1_window = h1.iloc[max(0, i-200):i+1]
 
         if h4 is not None:
-            h4_mask   = h4['time'] <= candle['time']
-            h4_window = h4[h4_mask].tail(250)
+            h4_window = closed_bars_frame(
+                h4, timeframe=cfg.get('tf_htf', 'H4'), as_of=decision_as_of, tail=250
+            )
         else:
             h4_window = h1_window.tail(250)
 
@@ -867,17 +902,13 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
                 continue
 
             trend  = calculate_trend(h1_window)
-            h1_atr = AverageTrueRange(h1_window['high'],
-                                      h1_window['low'],
-                                      h1_window['close']).average_true_range().iloc[-1]
+            h1_atr = wilder_atr(h1_window)
 
             macd_obj  = MACD(m1_window['close'])
             macd_line = macd_obj.macd().dropna().values
             macd_sig  = macd_obj.macd_signal().dropna().values
             rsi_vals  = RSIIndicator(m1_window['close']).rsi().dropna().values
-            atr_val   = AverageTrueRange(m1_window['high'],
-                                         m1_window['low'],
-                                         m1_window['close']).average_true_range().iloc[-1]
+            atr_val   = wilder_atr(m5_window)
 
             try:
                 from ta.volume import VolumeWeightedAveragePrice
@@ -916,7 +947,7 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
             continue
 
         try:
-            signals, _ = run_trade_decision_engine(
+            legacy_kwargs = dict(
                 symbol        = symbol,
                 point         = point_val,
                 current_price = candle['close'],
@@ -944,9 +975,42 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
                 m5_context    = m5_context,
                 htf_high      = h1_window['high'].max(),
                 htf_low       = h1_window['low'].min(),
-                last_closed_h1 = h1_window.iloc[-2],
+                last_closed_h1 = h1_window.iloc[-1],
                 htf_bias      = htf_bias,
                 thresholds    = thresholds,
+            )
+            pipeline_mode = cfg.get('strategy_pipeline_mode', 'legacy')
+            snapshot = None
+            adapter_config = None
+            if pipeline_mode != 'legacy':
+                snapshot = build_zone_reversal_snapshot(
+                    symbol=symbol,
+                    as_of=decision_as_of,
+                    bid=float(candle['close']),
+                    ask=float(candle['close']) + float(spread_val),
+                    h4=h4_window,
+                    h1=h1_window,
+                    m5=m5_window,
+                    demand_zones=demand_zones,
+                    supply_zones=supply_zones,
+                    active_trades={},
+                )
+                adapter_config = ZoneReversalConfig.from_thresholds(
+                    strategy_id='standard',
+                    point=point_val,
+                    tp_ratio=tp_ratio,
+                    pattern_bars=15,
+                    strategy_active=None,
+                    thresholds=thresholds,
+                )
+
+            signals, _ = run_zone_reversal_pipeline(
+                mode=pipeline_mode,
+                legacy_kwargs=legacy_kwargs,
+                snapshot=snapshot,
+                config=adapter_config,
+                decision_fn=run_trade_decision_engine,
+                parity_sink=_record_pipeline_parity,
             )
         except Exception:
             continue
@@ -978,6 +1042,266 @@ def run_simulation(symbol: str, tfs: dict, cfg: dict,
         open_trade.result      = "win" if open_trade.pnl >= 0 else "loss"
         trades.append(open_trade)
 
+    return trades, equity_points
+
+
+def run_simulation(symbol: str, tfs: dict, cfg: dict,
+                   start_idx: int = 0, end_idx: int = None) -> tuple:
+    """Causal M5 replay matching the live strategy's decision cadence.
+
+    ``start_idx`` and ``end_idx`` retain their historical H1 meaning so the
+    walk-forward caller remains compatible. They define the simulated date
+    range; all features are still selected by bar-close availability.
+    """
+    h1 = tfs.get(cfg.get('tf_zone', 'H1'))
+    m5 = tfs.get(cfg.get('tf_confirm', 'M5'))
+    h4 = tfs.get(cfg.get('tf_htf', 'H4'))
+    if h1 is None or m5 is None or h4 is None:
+        print(f"  [!] {symbol}: H1, M5, and H4 data are required. Skipping.")
+        return [], []
+    if h1.empty or m5.empty or h4.empty:
+        return [], []
+
+    h1_range = h1.iloc[start_idx:end_idx]
+    if h1_range.empty:
+        return [], []
+    range_start = pd.Timestamp(h1_range['time'].iloc[0])
+    range_end = pd.Timestamp(h1_range['time'].iloc[-1]) + timeframe_close_delta(
+        cfg.get('tf_zone', 'H1')
+    )
+    clock = m5[(m5['time'] >= range_start) & (m5['time'] < range_end)].reset_index(drop=True)
+    if len(clock) < 2:
+        return [], []
+
+    h1_opened = pd.DatetimeIndex(pd.to_datetime(h1['time'], utc=True))
+    m5_opened = pd.DatetimeIndex(pd.to_datetime(m5['time'], utc=True))
+    h4_opened = pd.DatetimeIndex(pd.to_datetime(h4['time'], utc=True))
+
+    spread_val = cfg['spread'].get(symbol, 0.0002)
+    point_val = cfg['point'].get(symbol, 0.00001)
+    pip_val = cfg['pip_value_per_lot'].get(symbol, 10.0)
+    trail_dist = cfg['trail_pips'] * point_val
+    max_slip = cfg['max_slippage_pips'] * point_val
+    risk_pct = cfg['risk_percent']
+    min_conf = cfg['min_confidence']
+    tp_ratio = cfg['tp_ratio']
+    thresholds = cfg['thresholds']
+    cooldown = cfg['cooldown_candles']
+    circ_max = cfg['max_consecutive_losses']
+    partial_pct = cfg.get('partial_close_pct', 0.5)
+    session_start, session_end = cfg.get('session_hours', (0, 24))
+    news_skip_prob = cfg.get('news_skip_prob', 0.0)
+    spread_mult_lo, spread_mult_hi = cfg.get('spread_mult_range', (1.0, 1.0))
+    record_equity = bool(cfg.get('record_equity', True))
+
+    trades = []
+    equity_points = []
+    open_trade = None
+    pending_signal = None
+    balance = cfg['initial_balance']
+    peak_balance = balance
+    last_trade_idx = -cooldown - 1
+    consec_losses = 0
+    current_day = None
+
+    cached_h1_key = None
+    cached_h1_context = None
+    cached_h4_key = None
+    cached_htf_bias = "NEUTRAL"
+
+    for i, candle in clock.iterrows():
+        decision_as_of = pd.Timestamp(candle['time']) + timeframe_close_delta(
+            cfg.get('tf_confirm', 'M5')
+        )
+
+        if pending_signal is not None and open_trade is None:
+            sig = pending_signal
+            side = sig['side']
+            dynamic_spread = random.uniform(spread_mult_lo, spread_mult_hi) * spread_val
+            entry = apply_spread_slippage(candle['open'], side, dynamic_spread, max_slip)
+            sl = float(sig['sl'])
+            tp = float(sig['tp'])
+            geometry_ok = (
+                sl < entry < tp if side == 'buy' else tp < entry < sl
+            )
+            if geometry_ok:
+                lot = calc_lot(balance, risk_pct, entry, sl, pip_val, point_val)
+                open_trade = BacktestTrade(
+                    symbol=symbol, side=side, entry=entry, sl=sl, tp=tp, lot=lot,
+                    open_idx=i, open_time=str(candle['time']),
+                    confidence=float(sig.get('confidence', 0)),
+                    strategy=sig.get('strategy', 'standard'),
+                    reason=sig.get('reason', ''),
+                )
+                last_trade_idx = i
+        pending_signal = None
+
+        current_equity = balance + (
+            calc_pnl(open_trade.side, open_trade.entry, candle['close'],
+                     open_trade.lot, pip_val, point_val)
+            if open_trade and open_trade.status == 'open' else 0.0
+        )
+        peak_balance = max(peak_balance, current_equity)
+        if record_equity:
+            dd_pct = ((peak_balance - current_equity) / peak_balance * 100) if peak_balance > 0 else 0
+            equity_points.append(
+                EquityPoint(i, str(candle['time']), balance, current_equity, dd_pct)
+            )
+
+        if open_trade and open_trade.status == 'open':
+            open_trade = update_trade(
+                open_trade, candle, trail_dist, pip_val, point_val, partial_pct
+            )
+            if open_trade.status == 'closed':
+                balance += open_trade.pnl
+                last_trade_idx = i
+                consec_losses = consec_losses + 1 if open_trade.result == 'loss' else 0
+                trades.append(open_trade)
+                open_trade = None
+
+        candle_day = decision_as_of.date()
+        if candle_day != current_day:
+            current_day = candle_day
+            consec_losses = 0
+        if consec_losses >= circ_max or (i - last_trade_idx) < cooldown:
+            continue
+        if open_trade and open_trade.status == 'open':
+            continue
+
+        h1_slice = closed_bars_slice(
+            h1_opened, timeframe=cfg.get('tf_zone', 'H1'),
+            as_of=decision_as_of, tail=300,
+        )
+        m5_slice = closed_bars_slice(
+            m5_opened, timeframe=cfg.get('tf_confirm', 'M5'),
+            as_of=decision_as_of, tail=80,
+        )
+        h4_slice = closed_bars_slice(
+            h4_opened, timeframe=cfg.get('tf_htf', 'H4'),
+            as_of=decision_as_of, tail=250,
+        )
+        h1_window = h1.iloc[h1_slice]
+        m5_window = m5.iloc[m5_slice]
+        h4_window = h4.iloc[h4_slice]
+        if len(h1_window) < 200 or len(m5_window) < 51 or len(h4_window) < 200:
+            continue
+
+        h1_key = h1_window['time'].iloc[-1]
+        if h1_key != cached_h1_key:
+            try:
+                demand_zones, supply_zones = detect_zones(h1_window)
+                fast_demand, fast_supply = detect_fast_zones(h1_window)
+                cached_h1_context = {
+                    'demand': demand_zones,
+                    'supply': supply_zones,
+                    'fast_demand': fast_demand,
+                    'fast_supply': fast_supply,
+                    'trend': calculate_trend(h1_window),
+                    'atr': wilder_atr(h1_window),
+                    'high': float(h1_window['high'].max()),
+                    'low': float(h1_window['low'].min()),
+                    'last': h1_window.iloc[-1],
+                }
+                cached_h1_key = h1_key
+            except Exception:
+                cached_h1_context = None
+        if not cached_h1_context:
+            continue
+
+        h4_key = h4_window['time'].iloc[-1]
+        if h4_key != cached_h4_key:
+            cached_htf_bias = get_htf_bias(
+                h4_window, cfg['htf_ema_fast'], cfg['htf_ema_slow']
+            )
+            cached_h4_key = h4_key
+        if cached_htf_bias == 'NEUTRAL':
+            continue
+
+        demand_zones = cached_h1_context['demand']
+        supply_zones = cached_h1_context['supply']
+        fast_demand = cached_h1_context['fast_demand']
+        fast_supply = cached_h1_context['fast_supply']
+        if not demand_zones and not supply_zones and not fast_demand and not fast_supply:
+            continue
+
+        decision_hour = decision_as_of.hour
+        if not (session_start <= decision_hour < session_end):
+            continue
+        if news_skip_prob and random.random() < news_skip_prob:
+            continue
+
+        try:
+            atr_val = wilder_atr(m5_window)
+            m5_context = {'trend': calculate_trend(m5_window)}
+            legacy_kwargs = dict(
+                symbol=symbol,
+                point=point_val,
+                current_price=float(candle['close']),
+                trend=cached_h1_context['trend'],
+                demand_zones=demand_zones,
+                supply_zones=supply_zones,
+                fast_demand_zones=fast_demand,
+                fast_supply_zones=fast_supply,
+                m1_candles_for_crt=None,
+                m5_candles_for_patterns=m5_window.iloc[-15:],
+                active_trades={}, zone_touch_counts={},
+                SL_BUFFER=0, TP_RATIO=tp_ratio,
+                CHECK_RANGE=max(atr_val, 50 * point_val),
+                LOT_SIZE=0.01, MAGIC=0, strategy_mode='standard',
+                atr=atr_val, htf_atr=cached_h1_context['atr'],
+                m5_context=m5_context,
+                htf_high=cached_h1_context['high'],
+                htf_low=cached_h1_context['low'],
+                last_closed_h1=cached_h1_context['last'],
+                htf_bias=cached_htf_bias,
+                thresholds=thresholds,
+                strategy_active_override=True,
+                emit_telemetry=False,
+            )
+            pipeline_mode = cfg.get('strategy_pipeline_mode', 'legacy')
+            snapshot = None
+            adapter_config = None
+            if pipeline_mode != 'legacy':
+                snapshot = build_zone_reversal_snapshot(
+                    symbol=symbol, as_of=decision_as_of,
+                    bid=float(candle['close']),
+                    ask=float(candle['close']) + float(spread_val),
+                    h4=h4_window, h1=h1_window, m5=m5_window,
+                    demand_zones=demand_zones, supply_zones=supply_zones,
+                    active_trades={},
+                )
+                adapter_config = ZoneReversalConfig.from_thresholds(
+                    strategy_id='standard', point=point_val,
+                    tp_ratio=tp_ratio, pattern_bars=15,
+                    strategy_active=True, thresholds=thresholds,
+                )
+            signals, _ = run_zone_reversal_pipeline(
+                mode=pipeline_mode, legacy_kwargs=legacy_kwargs,
+                snapshot=snapshot, config=adapter_config,
+                decision_fn=run_trade_decision_engine,
+                parity_sink=_record_pipeline_parity,
+            )
+        except Exception:
+            continue
+
+        if not signals:
+            continue
+        sig = max(signals, key=lambda item: item.get('confidence', 0))
+        if float(sig.get('confidence', 0)) >= min_conf:
+            pending_signal = sig
+
+    if open_trade and open_trade.status == 'open':
+        last_candle = clock.iloc[-1]
+        open_trade.status = 'closed'
+        open_trade.close_price = float(last_candle['close'])
+        open_trade.close_time = str(last_candle['time'])
+        open_trade.close_reason = 'END_OF_DATA'
+        open_trade.pnl = calc_pnl(
+            open_trade.side, open_trade.entry, last_candle['close'],
+            open_trade.lot, pip_val, point_val,
+        )
+        open_trade.result = 'win' if open_trade.pnl >= 0 else 'loss'
+        trades.append(open_trade)
     return trades, equity_points
 
 
@@ -1277,6 +1601,7 @@ def main():
     print(f"  [Config] TP Ratio:    {cfg['tp_ratio']} | Partial Close: {cfg['partial_close_pct']}")
     print(f"  [Config] Min Conf:    {cfg['min_confidence']} | TF Zone: {cfg['tf_zone']} | TF HTF: {cfg['tf_htf']}")
     print(f"  [Config] Strategy:    {cfg.get('strategy_name')} | Experiment: {cfg['experiment_id']} | Hash: {cfg['config_hash']}")
+    print(f"  [Config] Pipeline:    {cfg['strategy_pipeline_mode']}")
 
     if cfg.get('sensitivity', {}).get('enabled'):
         run_sensitivity_grid(cfg)

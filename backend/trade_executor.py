@@ -83,6 +83,17 @@ def place_order(symbol, side, lot, magic, comment="", sl=None, tp=None):
         if not mt5.initialize(): 
             print(f"[Exec] MT5 Init Failed")
             return None
+
+        # One account-wide position at most. This check shares the order-send
+        # lock, so simultaneous symbol signals cannot both pass before either
+        # order is sent.
+        positions = mt5.positions_get()
+        if positions is None:
+            print(f"[Exec] Position query failed; blocking {symbol} order")
+            return None
+        if len(positions) > 0:
+            print(f"[Exec] Global one-position limit blocked {symbol} order")
+            return None
         
         tick = mt5.symbol_info_tick(symbol)
         if not tick: 

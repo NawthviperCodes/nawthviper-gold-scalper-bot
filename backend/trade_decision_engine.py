@@ -23,13 +23,11 @@ import math
 from typing import List, Optional, Tuple
 
 from performance_tracker import is_strategy_active
-from candlestick_patterns import (
-    is_bullish_pin_bar,
-    is_bearish_pin_bar,
-)
 
 REJECTION_STATS = {
+    "B Zone Rejected": 0,
     "Weak Quality Zone": 0,
+    "HTF Bias Conflict": 0,
     "Too Many Touches": 0,
     "No Recent Touch": 0,
     "Full Touch Skip": 0,
@@ -62,32 +60,6 @@ def _safe_atr(atr: Optional[float], current_price: float) -> float:
         except Exception:
             pass
     return max(float(current_price) * 0.0005, 1e-9)
-
-
-def _is_doji(candle) -> bool:
-    rng = float(candle.high - candle.low)
-    if rng <= 0:
-        return False
-    body = abs(float(candle.close - candle.open))
-    return body <= rng * 0.10
-
-
-def _pattern_bonus(m5_df, side: str) -> Tuple[float, str]:
-    if m5_df is None or len(m5_df) < 1:
-        return 0.0, "no_pattern"
-
-    c = m5_df.iloc[-1]
-
-    if _is_doji(c):
-        return 0.06, "doji"
-
-    if side == "buy" and is_bullish_pin_bar(c.open, c.high, c.low, c.close):
-        return 0.05, "bullish_pin_bar"
-
-    if side == "sell" and is_bearish_pin_bar(c.open, c.high, c.low, c.close):
-        return 0.05, "bearish_pin_bar"
-
-    return 0.0, "no_pattern"
 
 
 def _infer_quality(zone: dict) -> str:
@@ -198,18 +170,6 @@ def _trend_bonus(m5_context, side: str) -> float:
     return 0.0
 
 
-def _htf_soft_bonus(htf_bias: str, side: str) -> float:
-    if side == "buy" and htf_bias == "UP":
-        return 0.03
-    if side == "sell" and htf_bias == "DOWN":
-        return 0.03
-    if side == "buy" and htf_bias == "DOWN":
-        return -0.02
-    if side == "sell" and htf_bias == "UP":
-        return -0.02
-    return 0.0
-
-
 def _build_signal(
     symbol: str,
     side: str,
@@ -221,23 +181,39 @@ def _build_signal(
     strategy_name: str,
     reason: str,
     confidence: float,
+    spread: float = 0.0,
 ):
     entry_price = float(current_price)
     wick = float(touch_ctx["sweep_wick"])
     stop_buffer = atr_val * 0.15
+    spread = max(float(spread), 0.0)
 
     if side == "buy":
-        sl = wick - stop_buffer
-        risk = entry_price - sl
+        origin_low = zone.get("displacement_origin_low")
+        structural_level = (
+            float(origin_low)
+            if origin_low is not None and float(origin_low) < wick
+            else wick
+        )
+        fill_price = entry_price + spread
+        sl = structural_level - stop_buffer
+        risk = fill_price - sl
         if risk <= 0:
             return None
-        tp = entry_price + risk * tp_ratio
+        tp = fill_price + risk * tp_ratio
     else:
-        sl = wick + stop_buffer
-        risk = sl - entry_price
+        origin_high = zone.get("displacement_origin_high")
+        structural_level = (
+            float(origin_high)
+            if origin_high is not None and float(origin_high) > wick
+            else wick
+        )
+        fill_price = entry_price
+        sl = structural_level + stop_buffer
+        risk = sl - fill_price
         if risk <= 0:
             return None
-        tp = entry_price - risk * tp_ratio
+        tp = fill_price - risk * tp_ratio
 
     return {
         "side": side,
@@ -262,9 +238,16 @@ def run_trade_decision_engine(
     atr=None, htf_atr=None,
     m5_context=None, htf_high=None, htf_low=None, last_closed_h1=None,
     fibo_zone=None, bollinger_bands=None,
-    htf_bias="NEUTRAL", thresholds={}
+    htf_bias="NEUTRAL", thresholds={}, strategy_active_override=None,
+    emit_telemetry=True, spread=0.0,
 ):
     signals = []
+
+    def reject(reason, zone_type, zone_price):
+        if not emit_telemetry:
+            return
+        REJECTION_STATS[reason] += 1
+        log_rejection(reason, zone_type, zone_price, strategy_mode, trend)
 
     if m5_candles_for_patterns is None or len(m5_candles_for_patterns) < 2:
         return [], []
@@ -283,21 +266,30 @@ def run_trade_decision_engine(
                 continue
 
             quality = _infer_quality(zone)
-            if quality not in {"A", "B"}:
-                REJECTION_STATS["Weak Quality Zone"] += 1
-                log_rejection("Weak Quality Zone", zone_type, zone.get("price"), strategy_mode, trend)
+            if quality == "B":
+                reject("B Zone Rejected", zone_type, zone.get("price"))
+                continue
+            if quality != "A":
+                reject("Weak Quality Zone", zone_type, zone.get("price"))
                 continue
 
             zone_touches = int(zone.get("touches", 0) or 0)
             if zone_touches > max_touch_allowed:
-                REJECTION_STATS["Too Many Touches"] += 1
-                log_rejection("Too Many Touches", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("Too Many Touches", zone_type, zone.get("price"))
                 continue
 
             freshness_class = _freshness_class(zone, max_touch_allowed)
             if freshness_class == "overused":
-                REJECTION_STATS["Too Many Touches"] += 1
-                log_rejection("Too Many Touches", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("Too Many Touches", zone_type, zone.get("price"))
+                continue
+
+            # Only a confirmed opposite H4 direction blocks the trade.
+            # NEUTRAL represents insufficient trend evidence and passes.
+            if side == "buy" and htf_bias == "DOWN":
+                reject("HTF Bias Conflict", zone_type, zone.get("price"))
+                continue
+            if side == "sell" and htf_bias == "UP":
+                reject("HTF Bias Conflict", zone_type, zone.get("price"))
                 continue
 
             touch_ctx = _recent_touch_context(
@@ -308,13 +300,11 @@ def run_trade_decision_engine(
                 lookback=15,
             )
             if touch_ctx is None:
-                REJECTION_STATS["No Recent Touch"] += 1
-                log_rejection("No Recent Touch", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("No Recent Touch", zone_type, zone.get("price"))
                 continue
 
             if touch_ctx["touch_depth"] == "full":
-                REJECTION_STATS["Full Touch Skip"] += 1
-                log_rejection("Full Touch Skip", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("Full Touch Skip", zone_type, zone.get("price"))
                 continue
 
             confirmed, confirm_reason = _simple_reclaim_confirmation(
@@ -324,8 +314,7 @@ def run_trade_decision_engine(
                 side,
             )
             if not confirmed:
-                REJECTION_STATS["No Reclaim Confirmation"] += 1
-                log_rejection("No Reclaim Confirmation", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("No Reclaim Confirmation", zone_type, zone.get("price"))
                 continue
 
             confidence = 0.56 if quality == "B" else 0.64
@@ -343,23 +332,22 @@ def run_trade_decision_engine(
                 confidence += 0.03
 
             confidence += _trend_bonus(m5_context, side)
-            confidence += _htf_soft_bonus(htf_bias, side)
-
-            pattern_bonus, pattern_name = _pattern_bonus(m5_candles_for_patterns, side)
-            confidence += pattern_bonus
 
             if active_trades and isinstance(active_trades, dict) and symbol in active_trades:
                 if active_trades[symbol].get("side") != side:
-                    REJECTION_STATS["Trade Conflict"] += 1
-                    log_rejection("Trade Conflict", zone_type, zone.get("price"), strategy_mode, trend)
+                    reject("Trade Conflict", zone_type, zone.get("price"))
                     continue
 
-            if not is_strategy_active(strategy_mode):
-                REJECTION_STATS["Inactive Strategy"] += 1
-                log_rejection("Inactive Strategy", zone_type, zone.get("price"), strategy_mode, trend)
+            strategy_active = (
+                is_strategy_active(strategy_mode)
+                if strategy_active_override is None
+                else bool(strategy_active_override)
+            )
+            if not strategy_active:
+                reject("Inactive Strategy", zone_type, zone.get("price"))
                 continue
 
-            reason = confirm_reason if pattern_name == "no_pattern" else f"{confirm_reason}+{pattern_name}"
+            reason = confirm_reason
             sig = _build_signal(
                 symbol=symbol,
                 side=side,
@@ -371,6 +359,7 @@ def run_trade_decision_engine(
                 strategy_name=strategy_mode,
                 reason=reason,
                 confidence=confidence,
+                spread=spread,
             )
             if sig is None:
                 continue
@@ -379,8 +368,7 @@ def run_trade_decision_engine(
             reward = abs(sig["tp"] - sig["entry"])
             rr = reward / risk if risk > 0 else 0.0
             if rr < rr_min:
-                REJECTION_STATS["Low RR"] += 1
-                log_rejection("Low RR", zone_type, zone.get("price"), strategy_mode, trend)
+                reject("Low RR", zone_type, zone.get("price"))
                 continue
 
             signals.append(sig)
